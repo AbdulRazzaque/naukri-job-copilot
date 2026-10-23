@@ -1,0 +1,31 @@
+{
+  "mode": "AUTONOMOUS",
+  "permissions": {
+    "auto_search": true,
+    "auto_inspect_jobs": true,
+    "auto_fill_forms": true,
+    "auto_upload_resume": true,
+    "auto_answer_screening": true,
+    "auto_submit_direct": true,
+    "auto_submit_company_portal": true,
+    "bypass_captcha": false,
+    "allow_payments": false,
+    "allow_sensitive_info": false
+  },
+  "safety_boundaries": {
+    "block_payments": true,
+    "block_sensitive_fields": true,
+    "block_unverified_facts": true,
+    "max_daily_applications": 45
+  },
+  "cooldown": {
+    "confirmed_min_sec": 120,
+    "confirmed_max_sec": 180,
+    "unconfirmed_min_sec": 45,
+    "unconfirmed_max_sec": 75
+  },
+  "retry_policy": {
+    "max_retries": 2,
+    "retry_delay_sec": 5
+  }
+}
