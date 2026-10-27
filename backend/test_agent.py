@@ -43,7 +43,7 @@ from agent_config import agent_config_manager, AgentConfigManager
 from ai_service import evaluate_application_question, is_sensitive_or_payment_question, call_gemini, query_ai
 from chat_panel_handler import naukri_chat_panel_handler, ChatPanelState, NaukriChatPanelHandler
 from reasoning_engine import reasoning_engine, AutonomousReasoningEngine, ALLOWED_TOOLS, AgentDecision, Observation
-from button_service import button_service, ButtonCategory
+from button_service import button_service, ButtonCategory, is_naukri_application_confirmed
 from database import lookup_experience, get_reasoning_metrics, record_experience, update_reasoning_metric
 
 class TestAgentAutomation(unittest.TestCase):
@@ -1007,7 +1007,7 @@ class TestAgentAutomation(unittest.TestCase):
             company="MultiRoundCorp",
             title="Senior Full Stack Developer"
         )
-        self.assertEqual(res["status"], ChatPanelState.FORM_COMPLETED)
+        self.assertIn(res["status"], [ChatPanelState.FORM_COMPLETED, ChatPanelState.APPLICATION_CONFIRMED])
         self.assertTrue(res["success"])
         self.assertEqual(len(res.get("processed", [])), 2, "Must process both sequential questions")
         page.close()
@@ -1688,7 +1688,219 @@ class TestAgentAutomation(unittest.TestCase):
         q2 = qa_engine.process_question("Have you completed or are you currently pursuing any professional qualification (e.g., CA, CS, CMA, CFA)?", "text")
         self.assertEqual(q2.get("answer"), "No")
 
+    # Scenario 15: Naukri Direct Apply Confirmation Detection (ACP & saveApply)
+    def test_56_is_naukri_application_confirmed_saveapply_url(self):
+        """Ensure saveApply URL with 200 response confirms application immediately."""
+        page = self.context.new_page()
+        page.goto("https://www.naukri.com/myapply/saveApply?strJobsarr=[261026002320]&multiApplyResp=%7B%22261026002320%22%3A200%7D")
+        is_conf, reason = is_naukri_application_confirmed(page)
+        self.assertTrue(is_conf)
+        self.assertEqual(reason, "URL_MULTI_APPLY_200")
+        page.close()
+
+    def test_57_is_naukri_application_confirmed_acp_elements(self):
+        """Ensure Apply Confirmation Page container (.acp-container) and heading are detected."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div id="root">
+                <div class="acp-container">
+                    <div class="acp-header-container">
+                        <h3>Applied to "Digital : Microservices(Java Full Stack, Angular)"</h3>
+                    </div>
+                </div>
+            </div>
+        """)
+        is_conf, reason = is_naukri_application_confirmed(page)
+        self.assertTrue(is_conf)
+        self.assertEqual(reason, "DOM_ACP_CONTAINER_FOUND")
+        page.close()
+
+    def test_58_is_naukri_application_confirmed_already_applied_badge(self):
+        """Ensure '#already-applied' span and 'Applied' button container confirm application."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div class="styles_jhc__apply-button-container__5Bqnb">
+                <span id="already-applied" class="styles_already-applied__4KDhw already-applied">Applied</span>
+            </div>
+        """)
+        is_conf, reason = is_naukri_application_confirmed(page)
+        self.assertTrue(is_conf)
+        self.assertEqual(reason, "DOM_ALREADY_APPLIED_BADGE")
+        page.close()
+
+    def test_59_is_naukri_application_confirmed_toast_notification(self):
+        """Ensure toast notifications with 'applied successfully' are detected."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div>
+                <div class="toaster visible">
+                    <span class="toast-message">You have successfully applied to Tata Consultancy Services</span>
+                </div>
+            </div>
+        """)
+        is_conf, reason = is_naukri_application_confirmed(page)
+        self.assertTrue(is_conf)
+        self.assertEqual(reason, "TOAST_CONFIRMATION_FOUND")
+        page.close()
+
+    def test_60_is_naukri_application_confirmed_prevents_false_positive(self):
+        """Ensure an unapplied job details page with normal Apply button returns False."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div>
+                <div class="apply-button-container">
+                    <button id="apply-button" class="apply-button">Apply</button>
+                </div>
+                <input class="suggestor-input" placeholder="Search jobs here" />
+            </div>
+        """)
+        is_conf, reason = is_naukri_application_confirmed(page)
+        self.assertFalse(is_conf)
+        self.assertEqual(reason, "NOT_CONFIRMED")
+    def test_61_reasoning_engine_verify_application_submission_action(self):
+        """Ensure reasoning engine VERIFY_APPLICATION_SUBMISSION safely runs and returns boolean confirmed & reason."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div class="apply-button-container">
+                <span id="already-applied" class="already-applied">Applied</span>
+            </div>
+        """)
+        dec = AgentDecision(
+            observation_summary="Verify applied status",
+            objective="Confirm application submission",
+            action="VERIFY_APPLICATION_SUBMISSION",
+            action_params={},
+            reason="Test verification",
+            source="TEST",
+            verification_plan="Check confirmation",
+            requires_user_input=False
+        )
+        res = reasoning_engine.act(page, dec, "TestCompany")
+        self.assertTrue(res.get("success"))
+        self.assertTrue(res.get("confirmed"))
+        self.assertEqual(res.get("reason"), "DOM_ALREADY_APPLIED_BADGE")
+        page.close()
+
+    def test_62_chat_panel_chip_options_without_input_field(self):
+        """Ensure chat panel with quick-reply chips and NO text input field is answered by clicking the chip."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div id="_chatBotContainer" class="_chatBotContainer" style="position: fixed; right: 0; width: 400px; height: 100%;">
+                <div class="chatContent" id="chat-content">
+                    <div class="botMsg msgText">Are you currently residing in Mumbai or willing to relocate to Mumbai?</div>
+                    <div class="quick-reply" id="chips-area">
+                        <button class="chip" id="opt-1" onclick="document.getElementById('_chatBotContainer').style.display='none';">Currently residing in Mumbai</button>
+                        <button class="chip" id="opt-2" onclick="document.getElementById('_chatBotContainer').style.display='none';">Willing to relocate to Mumbai</button>
+                        <button class="chip" id="opt-3">No</button>
+                    </div>
+                </div>
+            </div>
+        """)
+        res = naukri_chat_panel_handler.process_sequential_chat_questions(
+            page=page,
+            qa_engine_instance=qa_engine,
+            stop_event=threading.Event(),
+            company="Zenvior Technologies",
+            title="Fullstack Developer",
+            max_rounds=1
+        )
+        self.assertEqual(res.get("status"), ChatPanelState.FORM_COMPLETED)
+        self.assertTrue(res.get("success"))
+        self.assertNotIn("CHAT_INPUT_NOT_FOUND", res.get("reason", ""))
+        page.close()
+
+    def test_63_chat_panel_technical_skills_choice_without_input_field(self):
+        """Ensure backend technology choice questions (e.g. Golang or Node.js) pick Node.js from profile."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div id="_chatBotContainer" class="_chatBotContainer" style="position: fixed; right: 0; width: 400px; height: 100%;">
+                <div class="chatContent" id="chat-content">
+                    <div class="botMsg msgText">Which backend technology do you have the strongest hands-on experience in: Golang or Node.js?</div>
+                    <div class="quick-reply" id="chips-area">
+                        <button class="chip" id="opt-go">Golang</button>
+                        <button class="chip" id="opt-node" onclick="document.getElementById('_chatBotContainer').style.display='none';">Node.js</button>
+                    </div>
+                </div>
+            </div>
+        """)
+        res = naukri_chat_panel_handler.process_sequential_chat_questions(
+            page=page,
+            qa_engine_instance=qa_engine,
+            stop_event=threading.Event(),
+            company="Zenvior Technologies",
+            title="Fullstack Developer",
+            max_rounds=1
+        )
+        self.assertEqual(res.get("status"), ChatPanelState.FORM_COMPLETED)
+        self.assertTrue(res.get("success"))
+    def test_64_chat_panel_contenteditable_div_input_and_sendMsg(self):
+        """Ensure chat panel with contenteditable div input and .sendMsg Save button verifies answer and completes."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div id="_chatBotContainer" class="_chatBotContainer" style="position: fixed; right: 0; width: 400px; height: 100%;">
+                <div class="chatContent" id="chat-content">
+                    <div class="botMsg msgText">What is your highest educational qualification?</div>
+                    <div id="userInput__abc" class="textArea" contenteditable="true" data-placeholder="Type message here..."></div>
+                    <div class="sendMsgbtn_container">
+                        <div id="sendMsg__abc" class="send">
+                            <div class="sendMsg" tabindex="0" onclick="document.getElementById('_chatBotContainer').style.display='none';">Save</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        """)
+        res = naukri_chat_panel_handler.process_sequential_chat_questions(
+            page=page,
+            qa_engine_instance=qa_engine,
+            stop_event=threading.Event(),
+            company="Morningstar India",
+            title="Software Engineer",
+            max_rounds=1
+        )
+        self.assertEqual(res.get("status"), ChatPanelState.FORM_COMPLETED)
+        self.assertTrue(res.get("success"))
+        self.assertNotIn("ANSWER_INSERTION_UNVERIFIED", res.get("reason", ""))
+        self.assertNotIn("CHAT_INPUT_NOT_FOUND", res.get("reason", ""))
+        page.close()
+
+    def test_65_chat_panel_ssrc_radio_buttons_and_sendMsg(self):
+        """Ensure TCS style ssrc__radio-btn-container options click the label, enable .sendMsg Save button, and advance cleanly."""
+        page = self.context.new_page()
+        page.set_content("""
+            <div id="_chatBotContainer" class="_chatBotContainer" style="position: fixed; right: 0; width: 400px; height: 100%;">
+                <div class="chatContent" id="chat-content">
+                    <div class="botMsg msgText">Comfortable for Mumbai location ?</div>
+                    <div class="ssrc__radio-btn-container">
+                        <input type="radio" id="opt-yes" class="ssrc__radio" value="Yes">
+                        <label for="opt-yes" class="ssrc__label" onclick="document.getElementById('sendMsg__container').classList.remove('disabled');">Yes</label>
+                    </div>
+                    <div class="ssrc__radio-btn-container">
+                        <input type="radio" id="opt-no" class="ssrc__radio" value="No">
+                        <label for="opt-no" class="ssrc__label">No</label>
+                    </div>
+                    <div class="sendMsgbtn_container">
+                        <div id="sendMsg__container" class="send disabled">
+                            <div class="sendMsg" tabindex="0" onclick="if (!this.parentElement.classList.contains('disabled')) document.getElementById('_chatBotContainer').style.display='none';">Save</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        """)
+        res = naukri_chat_panel_handler.process_sequential_chat_questions(
+            page=page,
+            qa_engine_instance=qa_engine,
+            stop_event=threading.Event(),
+            company="Tata Consultancy Services",
+            title="Core Java Developer",
+            max_rounds=1
+        )
+        self.assertEqual(res.get("status"), ChatPanelState.FORM_COMPLETED)
+        self.assertTrue(res.get("success"))
+        self.assertIn("Comfortable for Mumbai location ?", res.get("processed", []))
+        page.close()
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

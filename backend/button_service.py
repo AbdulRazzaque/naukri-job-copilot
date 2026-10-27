@@ -225,23 +225,14 @@ class ButtonDetectionService:
             while time.time() - start_time < timeout_sec:
                 time.sleep(0.5)
 
-                # Check 1: Navigation occurred
+                # Check 1: Comprehensive confirmation check (including ACP saveApply & badges)
+                is_conf, conf_reason = is_naukri_application_confirmed(page)
+                if is_conf:
+                    return {"success": True, "outcome": "CONFIRMED", "reason": conf_reason}
+
+                # Check 2: Navigation occurred
                 if page.url != url_before:
                     return {"success": True, "outcome": "NAVIGATED", "new_url": page.url}
-
-                # Check 2: Success / Confirmation detected
-                has_success = page.evaluate("""() => {
-                    const text = Array.from(document.querySelectorAll('.apply-message, .success-message, .applied-badge, div, p, span'))
-                        .map(el => (el.innerText || '').toLowerCase())
-                        .join(' ');
-                    return text.includes('application has been sent') || 
-                           text.includes('applied successfully') || 
-                           text.includes('application received') || 
-                           text.includes('thank you for applying') ||
-                           text.includes('already applied');
-                }""")
-                if has_success:
-                    return {"success": True, "outcome": "CONFIRMED"}
 
                 # Check 3: Visible validation errors appeared
                 error_msg = page.evaluate("""() => {
@@ -257,4 +248,120 @@ class ButtonDetectionService:
         except Exception as e:
             return {"success": False, "outcome": "CLICK_FAILED", "error": str(e)}
 
+
+def is_naukri_application_confirmed(page: Page) -> Tuple[bool, str]:
+    """
+    Comprehensive verification to determine if a Naukri application succeeded:
+    1. Checks if page navigated to Apply Confirmation Page (/myapply/saveApply, multiApplyResp=200).
+    2. Checks page title 'Apply Confirmation'.
+    3. Checks Apply Confirmation Page DOM containers (.acp-container, .acp-header-container, text 'Applied to "..."').
+    4. Checks page-level badges (#already-applied, .already-applied, 'Applied', [class*='apply-button-container']:has-text('Applied')).
+    5. Checks toast/banner success alerts ('applied successfully', 'application has been sent', 'application received', etc.).
+    6. Checks chat drawer success text.
+    """
+    if not page:
+        return False, "PAGE_NONE"
+
+    try:
+        if page.is_closed():
+            return False, "PAGE_CLOSED"
+
+        url = (page.url or "").lower()
+        title = (page.title() or "").lower()
+
+        # 1. URL-level confirmation indicators (saveApply / ACP)
+        if "saveapply" in url or "myapply" in url:
+            if "multiapplyresp" in url and "200" in url:
+                return True, "URL_MULTI_APPLY_200"
+            return True, "URL_SAVE_APPLY_CONFIRMED"
+
+        # 2. Title-level confirmation
+        if "apply confirmation" in title:
+            return True, "TITLE_APPLY_CONFIRMATION"
+
+        # 3. DOM-level Apply Confirmation Page (ACP) elements
+        is_acp = page.evaluate("""() => {
+            const hasAcp = !!document.querySelector('.acp-container, .acp-header-container, .acp-header, div[class*="acp-"]');
+            const hasAppliedTo = Array.from(document.querySelectorAll('h1, h2, h3, div, p, span'))
+                .some(e => {
+                    const txt = (e.innerText || '').toLowerCase().trim();
+                    return txt.startsWith('applied to') || txt.includes('applied to "');
+                });
+            return hasAcp || hasAppliedTo;
+        }""")
+        if is_acp:
+            return True, "DOM_ACP_CONTAINER_FOUND"
+
+        # 4. Job details page badge & button elements
+        has_badge = page.evaluate("""() => {
+            const sels = [
+                '#already-applied',
+                '.already-applied',
+                '.applied-badge',
+                '.apply-message',
+                '.success-message',
+                'span#already-applied',
+                'button#already-applied',
+                'a#already-applied',
+                'div[class*="already-applied"]',
+                'span[class*="already-applied"]',
+                'div[class*="apply-button-container"]'
+            ];
+            for (const s of sels) {
+                const els = document.querySelectorAll(s);
+                for (const el of els) {
+                    if (el.offsetParent !== null) {
+                        const txt = (el.innerText || '').toLowerCase().trim();
+                        if (txt.includes('applied') || txt.includes('application sent')) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }""")
+        if has_badge:
+            return True, "DOM_ALREADY_APPLIED_BADGE"
+
+        # 5. Toast / snackbar notifications
+        has_toast = page.evaluate("""() => {
+            const toastEls = Array.from(document.querySelectorAll('.toast, .toaster, .n-toast, .snackbar, div[class*="toast"], div[class*="snackbar"], .server-message, .apply-message'))
+                .filter(e => e.offsetParent !== null);
+            const successTerms = [
+                'applied successfully', 'successfully applied', 'application has been sent',
+                'application received', 'thank you for applying', 'already applied',
+                'applied to', 'applied on', 'application submitted', 'profile sent', 'resume sent'
+            ];
+            for (const t of toastEls) {
+                const txt = (t.innerText || '').toLowerCase();
+                if (successTerms.some(term => txt.includes(term))) return true;
+            }
+            return false;
+        }""")
+        if has_toast:
+            return True, "TOAST_CONFIRMATION_FOUND"
+
+        # 6. Chat drawer success message
+        has_chat_success = page.evaluate("""() => {
+            const chatEls = Array.from(document.querySelectorAll('.botMsg, .chatContent, div[class*="botMsg"], div[class*="chatMsg"], .bot-row, p.msg, div.apply-message, .success-title'))
+                .filter(e => e.offsetParent !== null);
+            const text = chatEls.map(el => (el.innerText || '').toLowerCase()).join(' ');
+            return text.includes('application has been sent') || 
+                   text.includes('applied successfully') || 
+                   text.includes('application received') || 
+                   text.includes('thank you for applying') ||
+                   text.includes('applied on') ||
+                   text.includes('already applied') ||
+                   text.includes('applied to');
+        }""")
+        if has_chat_success:
+            return True, "CHAT_SUCCESS_MESSAGE_FOUND"
+
+    except Exception as e:
+        return False, f"VERIFY_ERROR: {e}"
+
+    return False, "NOT_CONFIRMED"
+
+
 button_service = ButtonDetectionService()
+

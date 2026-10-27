@@ -6,6 +6,7 @@ from playwright.sync_api import Page, Locator
 
 from question_answering import QuestionAnsweringEngine, QuestionCategory, qa_engine
 from database import record_experience, lookup_experience, update_reasoning_metric
+from button_service import is_naukri_application_confirmed
 
 class ChatPanelState:
     QUESTION_DETECTED = "QUESTION_DETECTED"
@@ -224,33 +225,266 @@ class NaukriChatPanelHandler:
 
         # Strategy 3: Scoped input selectors
         candidate_selectors = [
+            "div.textArea[contenteditable='true']",
+            "div.textArea",
+            "div[class*='textArea' i][contenteditable='true']",
+            "div[class*='textArea' i]",
+            "[contenteditable='true']",
             "input[placeholder*='Type message' i]",
             "textarea[placeholder*='Type message' i]",
             "input[placeholder*='Type' i]",
             "textarea[placeholder*='Type' i]",
+            "input[placeholder*='answer' i]",
+            "textarea[placeholder*='answer' i]",
+            "input[placeholder*='reply' i]",
+            "input[placeholder*='enter' i]",
+            "input[placeholder*='write' i]",
             "input.chat-input",
             "textarea.chat-input",
             ".user-input input",
             ".user-input textarea",
-            "div[class*='chatInput'] input",
-            "div[class*='chatInput'] textarea",
-            "div[class*='chatbot'] input[type='text']",
-            "div[class*='drawer'] input[type='text']",
+            "div[class*='chatInput' i] input",
+            "div[class*='chatInput' i] textarea",
+            "div[class*='chatbot' i] input[type='text']",
+            "div[class*='drawer' i] input[type='text']",
+            "[role='textbox']",
             "input[type='text']:not([disabled])",
-            "input:not([type='hidden']):not([disabled])"
+            "input:not([type='hidden']):not([disabled]):not([type='checkbox']):not([type='radio'])"
         ]
 
-        for sel in candidate_selectors:
-            try:
-                candidates = root.locator(sel)
-                for i in range(candidates.count()):
-                    cand = candidates.nth(i)
-                    if cand.is_visible() and cand.is_enabled():
-                        return cand
-            except Exception:
-                continue
+        roots = [root]
+        if root != page:
+            roots.append(page)
+
+        for r in roots:
+            for sel in candidate_selectors:
+                try:
+                    candidates = r.locator(sel)
+                    for i in range(candidates.count()):
+                        cand = candidates.nth(i)
+                        if cand.is_visible() and cand.is_enabled():
+                            return cand
+                except Exception:
+                    continue
 
         return None
+
+    def extract_chat_options(self, page: Page, panel: Optional[Locator] = None) -> List[Dict[str, Any]]:
+        """
+        Extracts visible quick-reply chips, pill buttons, or radio choices associated with the question.
+        Returns a list of dicts: [{"locator": loc, "text": clean_text, "value": val}]
+        """
+        chip_selectors = [
+            "label.ssrc__label",
+            "label[class*='ssrc__label']",
+            ".ssrc__radio-btn-container label",
+            "label[class*='radio' i]",
+            "label[class*='chip' i]",
+            "div.ssrc__radio-btn-container label",
+            ".chip",
+            ".botOption",
+            "button.option-btn",
+            "div.quick-reply",
+            "div[class*='quickReply' i]",
+            "div[class*='quick-reply' i]",
+            "span.chip",
+            ".chat-chip",
+            "div[class*='chat-chip' i]",
+            ".option",
+            "button[class*='chip' i]",
+            "div[class*='chip' i]",
+            "span[class*='chip' i]",
+            "div[class*='pill' i]",
+            "span[class*='pill' i]",
+            "button[class*='pill' i]",
+            "div[class*='choice' i]",
+            "button[class*='choice' i]",
+            "span[class*='choice' i]",
+            "div[class*='radio' i]",
+            "[role='radio']",
+            "input[type='radio']",
+            ".bot-option",
+            "div[class*='botOption' i]",
+            "div[class*='bot-option' i]",
+            ".chatContent button",
+            ".chatContent label",
+            ".chatContent [role='button']"
+        ]
+        
+        ignored_button_words = ["save", "submit", "send", "close", "cancel", "dismiss", "back", "next", "attach", "upload", "clear"]
+        options = []
+        seen_texts = set()
+
+        roots = [panel, page] if panel is not None else [page]
+        for root_el in roots:
+            for sel in chip_selectors:
+                try:
+                    candidates = root_el.locator(sel)
+                    for i in range(candidates.count()):
+                        cand = candidates.nth(i)
+                        if cand.is_visible():
+                            try:
+                                txt = cand.evaluate("""el => {
+                                    if (el.tagName === 'INPUT' && el.labels && el.labels.length > 0) {
+                                        return (el.labels[0].innerText || el.labels[0].textContent || '').trim();
+                                    }
+                                    return (el.innerText || el.textContent || el.value || '').trim();
+                                }""")
+                            except Exception:
+                                txt = (cand.inner_text() or "").strip()
+                            if not txt or len(txt) > 120:
+                                continue
+                            txt_low = txt.lower()
+                            if any(u in txt_low for u in ignored_button_words):
+                                continue
+                            if txt_low in seen_texts:
+                                continue
+                            seen_texts.add(txt_low)
+                            val = ""
+                            try:
+                                val = cand.evaluate("""el => {
+                                    if (el.value) return el.value;
+                                    if (el.getAttribute('data-value')) return el.getAttribute('data-value');
+                                    if (el.htmlFor) {
+                                        const inp = document.getElementById(el.htmlFor);
+                                        if (inp && inp.value) return inp.value;
+                                    }
+                                    return '';
+                                }""")
+                            except Exception:
+                                try:
+                                    val = cand.get_attribute("value") or ""
+                                except Exception:
+                                    pass
+                            options.append({
+                                "locator": cand,
+                                "text": txt,
+                                "value": val or txt
+                            })
+                except Exception:
+                    continue
+            if options:
+                break
+
+        return options
+
+    def _find_matching_option(self, available_options: List[Dict[str, Any]], answer: str, category: str = "") -> Optional[Dict[str, Any]]:
+        """Intelligently matches an answer string against extracted chat options."""
+        if not available_options or not answer:
+            return None
+        ans_low = answer.strip().lower()
+        
+        # 1. Exact match
+        for opt in available_options:
+            otxt = opt["text"].strip().lower()
+            oval = opt["value"].strip().lower()
+            if otxt == ans_low or oval == ans_low:
+                return opt
+
+        # 2. Location & Relocation matching (e.g. Mumbai, Kurla, Willing to relocate)
+        if category in [QuestionCategory.RELOCATION, QuestionCategory.LOCATION] or "mumbai" in ans_low or ans_low in ["yes", "true"]:
+            loc_terms = [
+                "currently residing in mumbai", "residing in mumbai", "reside in mumbai",
+                "i currently reside in mumbai", "mumbai", "kurla", "willing to relocate to mumbai",
+                "open to relocate to mumbai", "willing to relocate", "open to relocate", "relocate",
+                "yes", "yes, residing", "yes, willing", "both", "agree"
+            ]
+            for term in loc_terms:
+                match = next((o for o in available_options if term in o["text"].lower() or term in o["value"].lower()), None)
+                if match:
+                    return match
+
+        # 3. Technical Skills matching (e.g. Node.js vs Golang)
+        if category == QuestionCategory.TECHNICAL_SKILLS or any(k in ans_low for k in ["node", "react", "mern", "typescript"]):
+            if "node" in ans_low:
+                match = next((o for o in available_options if any(k in o["text"].lower() or k in o["value"].lower() for k in ["node.js", "nodejs", "node js", "node"])), None)
+                if match:
+                    return match
+            if "react" in ans_low:
+                match = next((o for o in available_options if any(k in o["text"].lower() or k in o["value"].lower() for k in ["react.js", "reactjs", "react js", "react"])), None)
+                if match:
+                    return match
+
+        # 4. Notice Period matching
+        if category == QuestionCategory.NOTICE_PERIOD or "immediate" in ans_low:
+            for term in ["immediate", "0-15", "15 day", "less than 15", "serving", "15", "30 day", "1 month", "30", "0"]:
+                match = next((o for o in available_options if term in o["text"].lower() or term in o["value"].lower()), None)
+                if match:
+                    return match
+
+        # 5. Experience matching
+        if category == QuestionCategory.EXPERIENCE or "year" in ans_low or "5" in ans_low:
+            for term in ["5+", "5 to", "5-", "5 years", "5 year", "4-6", "3-5", "5"]:
+                match = next((o for o in available_options if term in o["text"].lower() or term in o["value"].lower()), None)
+                if match:
+                    return match
+
+        # 6. Yes / Affirmative matching
+        if ans_low in ["yes", "true", "agree", "positive"]:
+            for term in ["yes", "agree", "confirm", "comfortable", "i agree", "available", "willing", "residing"]:
+                match = next((o for o in available_options if term in o["text"].lower() or term in o["value"].lower()), None)
+                if match:
+                    return match
+
+        # 7. Substring matching
+        for opt in available_options:
+            otxt = opt["text"].strip().lower()
+            oval = opt["value"].strip().lower()
+            if ans_low in otxt or otxt in ans_low or (len(ans_low) > 3 and ans_low in oval):
+                return opt
+
+        return None
+
+    def _is_button_enabled(self, loc: Locator) -> bool:
+        """
+        Checks whether a button or clickable div is enabled, verifying both
+        Playwright is_enabled() and CSS classes like .disabled or disabled attribute.
+        """
+        try:
+            if not loc.is_enabled():
+                return False
+            is_disabled = loc.evaluate("""el => {
+                if (el.disabled || el.getAttribute('aria-disabled') === 'true') return true;
+                if (el.classList && el.classList.contains('disabled')) return true;
+                if (el.closest('.disabled') || el.closest('[disabled]')) return true;
+                return false;
+            }""")
+            return not is_disabled
+        except Exception:
+            try:
+                return loc.is_enabled()
+            except Exception:
+                return True
+
+    def _get_element_value(self, loc: Locator) -> str:
+        """
+        Safely retrieves the entered text/value from input, textarea, or contenteditable element.
+        Avoids Playwright's input_value() exception on contenteditable divs.
+        """
+        try:
+            val = loc.evaluate("""el => {
+                if (el.isContentEditable) {
+                    return (el.innerText || el.textContent || '').trim();
+                }
+                if (el.value !== undefined && el.value !== null && el.value !== '') {
+                    return String(el.value).trim();
+                }
+                return (el.innerText || el.textContent || '').trim();
+            }""")
+            if val:
+                return val
+        except Exception:
+            pass
+
+        try:
+            return loc.input_value().strip()
+        except Exception:
+            pass
+
+        try:
+            return (loc.inner_text() or "").strip()
+        except Exception:
+            return ""
 
     def locate_save_button(self, page: Page, panel: Optional[Locator] = None) -> Optional[Locator]:
         """
@@ -274,7 +508,7 @@ class NaukriChatPanelHandler:
                 loc = root.get_by_role("button", name=name_regex)
                 for i in range(loc.count()):
                     btn = loc.nth(i)
-                    if btn.is_visible() and btn.is_enabled():
+                    if btn.is_visible() and self._is_button_enabled(btn):
                         btn_cls = (btn.get_attribute("class") or "").lower()
                         if any(u in btn_cls for u in ["save-job", "bookmark", "styles_save-job"]):
                             continue
@@ -284,6 +518,15 @@ class NaukriChatPanelHandler:
 
         # Strategy 2: Scoped CSS selectors within panel
         candidate_selectors = [
+            # Naukri chatbot specific send/save buttons
+            ".sendMsg",
+            "div.sendMsg",
+            "div[class*='sendMsg' i]",
+            "div.sendMsgbtn_container .sendMsg",
+            "div.send:not(.disabled) .sendMsg",
+            "div.send:not(.disabled)",
+            "div[class*='sendMsgbtn_container' i] [class*='sendMsg' i]",
+            # Generic button selectors
             "button.save-btn",
             "button[class*='save']",
             "button:has-text('Save')",
@@ -295,7 +538,9 @@ class NaukriChatPanelHandler:
             "button.submit-btn",
             ".sendBtn",
             "input[type='submit'][value*='Save' i]",
-            "button[type='submit']"
+            "button[type='submit']",
+            "[role='button']:has-text('Save')",
+            "[role='button']:has-text('Submit')"
         ]
 
         for sel in candidate_selectors:
@@ -303,7 +548,7 @@ class NaukriChatPanelHandler:
                 candidates = root.locator(sel)
                 for i in range(candidates.count()):
                     cand = candidates.nth(i)
-                    if cand.is_visible() and cand.is_enabled():
+                    if cand.is_visible() and self._is_button_enabled(cand):
                         btn_cls = (cand.get_attribute("class") or "").lower()
                         if any(u in btn_cls for u in ["save-job", "bookmark", "styles_save-job"]):
                             continue
@@ -318,6 +563,7 @@ class NaukriChatPanelHandler:
     def fill_and_verify_answer(self, page: Page, input_loc: Locator, answer: str) -> bool:
         """
         Enters the generated answer using Playwright interactions.
+        Handles both standard input/textarea elements and contenteditable divs.
         Triggers input and change events and verifies the entered value is retained.
         """
         if not answer:
@@ -328,33 +574,64 @@ class NaukriChatPanelHandler:
             input_loc.click()
             time.sleep(0.1)
 
-            # Clear existing content if any
-            input_loc.fill("")
-            time.sleep(0.05)
+            # Determine if element is contenteditable
+            is_editable = False
+            try:
+                is_editable = input_loc.evaluate("el => !!el.isContentEditable")
+            except Exception:
+                pass
 
-            # Fill the answer
-            input_loc.fill(answer)
+            if is_editable:
+                # Clear contenteditable container cleanly
+                input_loc.evaluate("""el => {
+                    el.innerText = '';
+                    el.textContent = '';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }""")
+                time.sleep(0.05)
+                try:
+                    input_loc.fill(answer)
+                except Exception:
+                    input_loc.type(answer, delay=15)
+            else:
+                try:
+                    input_loc.fill("")
+                    time.sleep(0.05)
+                    input_loc.fill(answer)
+                except Exception:
+                    input_loc.type(answer, delay=15)
+
             time.sleep(0.1)
-
             # Dispatch necessary events for React/Angular/Vue bindings
             input_loc.dispatch_event("input")
             input_loc.dispatch_event("change")
             time.sleep(0.1)
 
             # Verify that the entered value is retained
-            val = input_loc.input_value()
+            val = self._get_element_value(input_loc)
             if val and (answer.lower() in val.lower() or val.strip() == answer.strip()):
                 return True
 
-            # Fallback typing character-by-character
+            # Fallback: re-clear and type character-by-character
             input_loc.click()
-            input_loc.fill("")
+            if is_editable:
+                input_loc.evaluate("""el => {
+                    el.innerText = '';
+                    el.textContent = '';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }""")
+            else:
+                try:
+                    input_loc.fill("")
+                except Exception:
+                    pass
+
             input_loc.type(answer, delay=20)
             input_loc.dispatch_event("input")
             input_loc.dispatch_event("change")
             time.sleep(0.1)
 
-            val = input_loc.input_value()
+            val = self._get_element_value(input_loc)
             return bool(val and (answer.lower() in val.lower() or val.strip() == answer.strip()))
 
         except Exception as e:
@@ -417,6 +694,11 @@ class NaukriChatPanelHandler:
         while time.time() - start_time < timeout_sec:
             time.sleep(0.5)
 
+            # Check 0: Did page transition to confirmation (saveApply, ACP, or toast)?
+            is_conf, conf_reason = is_naukri_application_confirmed(page)
+            if is_conf:
+                return {"transition": "CONFIRMED", "reason": conf_reason}
+
             # Check 1: Did the panel close?
             panel = self.detect_chat_panel(page)
             if not panel or not panel.is_visible():
@@ -431,6 +713,8 @@ class NaukriChatPanelHandler:
                        text.includes('applied successfully') || 
                        text.includes('application received') || 
                        text.includes('thank you for applying') ||
+                       text.includes('applied on') ||
+                       text.includes('applied to') ||
                        text.includes('already applied');
             }""")
             if has_success:
@@ -529,9 +813,12 @@ class NaukriChatPanelHandler:
                 consecutive_same_q = 1
                 last_seen_q = question
 
-            # Locate chat input / textarea
+            # 1. Check for quick-reply chips / options in the panel first
+            available_options = self.extract_chat_options(page, panel)
+
+            # 2. Locate chat input / textarea
             chat_input = self.locate_chat_input(page, panel)
-            input_type = "text"
+            input_type = "select" if available_options else "text"
             if chat_input:
                 try:
                     input_type = chat_input.get_attribute("type") or "text"
@@ -540,10 +827,12 @@ class NaukriChatPanelHandler:
                 except Exception:
                     pass
 
-            # Generate verified answer from candidate profile
+            # 3. Generate verified answer from candidate profile, passing options if detected
+            opt_payload = [{"text": o["text"], "value": o["value"]} for o in available_options] if available_options else None
             qa_res = qa_engine_instance.process_question(
                 question_text=question,
                 input_type=input_type,
+                available_options=opt_payload,
                 job_title=title,
                 company_name=company
             )
@@ -560,7 +849,7 @@ class NaukriChatPanelHandler:
                 }
 
             answer = qa_res.get("answer", "")
-            if not answer:
+            if not answer and not qa_res.get("selected_option"):
                 self.logger(f"No answer generated for question: '{question}'. Marking NEEDS_USER_INPUT.", "WARNING")
                 update_reasoning_metric("unresolved_questions_count", 1.0, question[:40])
                 page.bring_to_front()
@@ -572,11 +861,62 @@ class NaukriChatPanelHandler:
 
             self.logger(f"💡 Generated Answer: '{answer}' (Source: {qa_res.get('source')})", "INFO")
 
-            # Check if input field is visible
+            # 4. PATH A: If option chips/buttons are present, match and click
+            option_clicked = False
+            if available_options:
+                matched_opt = None
+                sel_opt = qa_res.get("selected_option")
+                if sel_opt:
+                    matched_opt = next((o for o in available_options if o["text"].strip().lower() == sel_opt["text"].strip().lower() or o["value"].strip().lower() == sel_opt.get("value", "").strip().lower()), None)
+                if not matched_opt:
+                    matched_opt = self._find_matching_option(available_options, answer, qa_res.get("category", ""))
+                
+                if matched_opt:
+                    try:
+                        opt_loc = matched_opt["locator"]
+                        opt_loc.scroll_into_view_if_needed()
+                        time.sleep(0.2)
+                        opt_loc.click()
+                        self.logger(f"✅ Option clicked: '{matched_opt['text']}' (Source: {qa_res.get('source')})", "SUCCESS")
+                        option_clicked = True
+                        time.sleep(0.5)
+
+                        # Check if a Save button appeared/is enabled
+                        save_btn = self.locate_save_button(page, panel)
+                        if save_btn and save_btn.is_visible() and self._is_button_enabled(save_btn):
+                            transition_res = self.click_save_and_wait_transition(page, save_btn, initial_question=question)
+                        else:
+                            transition_res = self.wait_for_transition(page, initial_question=question, timeout_sec=4.0)
+
+                        t_type = transition_res.get("transition")
+                        self.logger(f"UI Transition Result: {t_type}", "INFO")
+                        processed_questions.append(question)
+
+                        if t_type == "PANEL_CLOSED":
+                            self.logger("🎉 Chat panel closed successfully after option selection.", "SUCCESS")
+                            return {"status": ChatPanelState.FORM_COMPLETED, "success": True, "processed": processed_questions}
+                        elif t_type == "CONFIRMED":
+                            self.logger("🎉 Application confirmation detected inside chat panel!", "SUCCESS")
+                            return {"status": ChatPanelState.APPLICATION_CONFIRMED, "success": True, "processed": processed_questions}
+                        elif t_type in ["NEXT_QUESTION", "TIMEOUT"]:
+                            continue
+                    except Exception as opt_err:
+                        self.logger(f"Notice while clicking option chip: {opt_err}", "WARNING")
+
+            if option_clicked:
+                continue
+
+            # 5. PATH B: Fill Text Input
             if not chat_input or not chat_input.is_visible():
                 # Attempt recovery: look for quick-reply chips matching answer
                 chip_match = self._click_matching_chip(page, panel, answer)
                 if chip_match:
+                    time.sleep(1.5)
+                    continue
+
+                # Fallback: check general quick reply chips
+                chip_recovered = self._handle_quick_reply_chips(page, panel, stop_event)
+                if chip_recovered:
                     time.sleep(1.5)
                     continue
 
@@ -596,11 +936,23 @@ class NaukriChatPanelHandler:
                 # Self-correction: retry with type
                 try:
                     chat_input.click()
+                    is_editable = False
+                    try:
+                        is_editable = chat_input.evaluate("el => !!el.isContentEditable")
+                    except Exception:
+                        pass
+                    if is_editable:
+                        chat_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
+                    else:
+                        try:
+                            chat_input.fill("")
+                        except Exception:
+                            pass
                     chat_input.type(answer, delay=25)
                     chat_input.dispatch_event("input")
                     chat_input.dispatch_event("change")
-                    val = chat_input.input_value()
-                    inserted = bool(val and answer.lower() in val.lower())
+                    val = self._get_element_value(chat_input)
+                    inserted = bool(val and (answer.lower() in val.lower() or val.strip() == answer.strip()))
                 except Exception:
                     pass
 
@@ -618,7 +970,7 @@ class NaukriChatPanelHandler:
 
             # Check for Save button or submit directly via Enter/send icon
             save_btn = self.locate_save_button(page, panel)
-            if save_btn and save_btn.is_visible() and save_btn.is_enabled():
+            if save_btn and save_btn.is_visible() and self._is_button_enabled(save_btn):
                 transition_res = self.click_save_and_wait_transition(page, save_btn, initial_question=question)
             else:
                 self.logger("No Save button in chat panel. Submitting answer via Enter key / send icon...", "INFO")
@@ -681,48 +1033,54 @@ class NaukriChatPanelHandler:
 
         return {"status": ChatPanelState.FORM_COMPLETED, "success": True, "processed": processed_questions}
 
-    def _handle_quick_reply_chips(self, page: Page, panel: Locator, stop_event: threading.Event) -> bool:
+    def _handle_quick_reply_chips(self, page: Page, panel: Optional[Locator], stop_event: threading.Event) -> bool:
         """Handles any quick-reply chips or option buttons visible in the chat panel."""
         try:
-            chips = panel.locator(".chip, .botOption, button.option-btn, div.quick-reply, span.chip, .chat-chip, .option, button[class*='chip'], div[class*='chip']")
-            for i in range(chips.count()):
-                chip = chips.nth(i)
-                if chip.is_visible():
-                    txt = (chip.inner_text() or "").strip().lower()
-                    if not txt:
-                        continue
-                    # Notice Period Chips (Prioritize Immediate Joiner)
-                    if any(k in txt for k in ['immediate', '0-15', '15 day', 'less than 15', 'serving', '15', '30 day', '0']):
-                        self.logger(f"Clicked Notice Period chip: '{chip.inner_text().strip()}'", "INFO")
-                        chip.click()
-                        return True
-                    # Experience Chips (5+ years)
-                    elif any(k in txt for k in ['5+ year', '5+ years', '5 years', '5 year', '5-7', '4-6', '5+', '5']):
-                        self.logger(f"Clicked Experience chip: '{chip.inner_text().strip()}'", "INFO")
-                        chip.click()
-                        return True
-                    # Affirmative / Yes
-                    elif any(txt.startswith(y) or txt == y for y in ['yes', 'agree', 'confirm', 'comfortable', 'available']):
-                        self.logger(f"Clicked Affirmative chip: '{chip.inner_text().strip()}'", "INFO")
-                        chip.click()
-                        return True
+            chip_opts = self.extract_chat_options(page, panel)
+            for opt in chip_opts:
+                txt = opt["text"].strip().lower()
+                chip = opt["locator"]
+
+                # Location / Relocate Chips (Mumbai / Kurla)
+                if any(k in txt for k in ['currently residing in mumbai', 'residing in mumbai', 'reside in mumbai', 'mumbai', 'kurla', 'willing to relocate', 'open to relocate', 'relocate', 'remote']):
+                    self.logger(f"Clicked Location chip: '{opt['text']}'", "INFO")
+                    chip.click()
+                    return True
+                # Tech Skills Chips (Node.js / React.js)
+                elif any(k in txt for k in ['node.js', 'node js', 'nodejs', 'react.js', 'react js', 'react', 'mern', 'typescript', 'javascript', 'express', 'mongodb', 'mysql', 'postgresql']):
+                    self.logger(f"Clicked Tech Skill chip: '{opt['text']}'", "INFO")
+                    chip.click()
+                    return True
+                # Notice Period Chips (Prioritize Immediate Joiner)
+                elif any(k in txt for k in ['immediate', '0-15', '15 day', 'less than 15', 'serving', '15', '30 day', '1 month', '30', '0']):
+                    self.logger(f"Clicked Notice Period chip: '{opt['text']}'", "INFO")
+                    chip.click()
+                    return True
+                # Experience Chips (5+ years)
+                elif any(k in txt for k in ['5+ year', '5+ years', '5 years', '5 year', '5-7', '4-6', '5+', '5']):
+                    self.logger(f"Clicked Experience chip: '{opt['text']}'", "INFO")
+                    chip.click()
+                    return True
+                # Affirmative / Yes
+                elif any(txt.startswith(y) or txt == y for y in ['yes', 'agree', 'confirm', 'comfortable', 'available', 'i agree', 'residing', 'willing']):
+                    self.logger(f"Clicked Affirmative chip: '{opt['text']}'", "INFO")
+                    chip.click()
+                    return True
         except Exception:
             pass
         return False
 
-    def _click_matching_chip(self, page: Page, panel: Locator, answer: str) -> bool:
+    def _click_matching_chip(self, page: Page, panel: Optional[Locator], answer: str) -> bool:
         """Attempts to match answer to an available chip button."""
         try:
-            ans_low = answer.lower().strip()
-            chips = panel.locator("button, [role='button'], .chip, .botOption, .option")
-            for i in range(chips.count()):
-                chip = chips.nth(i)
-                if chip.is_visible():
-                    txt = (chip.inner_text() or "").lower().strip()
-                    if txt and (ans_low in txt or txt in ans_low):
-                        chip.click()
-                        self.logger(f"Matched and clicked option chip: '{chip.inner_text().strip()}'", "INFO")
-                        return True
+            chip_opts = self.extract_chat_options(page, panel)
+            matched = self._find_matching_option(chip_opts, answer)
+            if matched:
+                matched["locator"].scroll_into_view_if_needed()
+                time.sleep(0.2)
+                matched["locator"].click()
+                self.logger(f"Matched and clicked option chip: '{matched['text']}'", "INFO")
+                return True
         except Exception:
             pass
         return False

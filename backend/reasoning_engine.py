@@ -11,7 +11,7 @@ from ai_service import query_ai, get_candidate_profile, call_gemini
 from question_answering import QuestionAnsweringEngine, qa_engine, QuestionCategory
 from database import record_experience, lookup_experience, update_reasoning_metric, get_reasoning_metrics, record_application
 from chat_panel_handler import naukri_chat_panel_handler, ChatPanelState
-from button_service import button_service, ButtonCategory
+from button_service import button_service, ButtonCategory, is_naukri_application_confirmed
 from form_engine import (
     detect_and_collect_form_questions,
     fill_form_control,
@@ -371,16 +371,170 @@ class AutonomousReasoningEngine:
             })
 
             system_prompt = (
-                "You are an expert AI Job Application Reasoning Engine. "
-                "Analyze the page observation and candidate profile. "
-                "Determine the single next best action to advance the application. "
-                "Respond ONLY with valid JSON having the following keys: "
-                "observation_summary, objective, action, action_params, reason, source, verification_plan, requires_user_input. "
-                "The 'action' MUST be one of the allowed_actions in the prompt. "
-                "Never invent personal information, salary, or experience. "
-                "If a mandatory field is unknown, specify action as 'REQUEST_USER_INPUT'."
-            )
+                """
+                    You are an expert AI Job Application Reasoning Engine responsible for
+                    assisting a candidate with job discovery and application workflows on
+                    Naukri.com.
 
+                    Your role is to analyze the current page observation, candidate profile,
+                    job description, form state, and available browser actions to determine
+                    the single safest and most useful next action.
+
+                    You operate as a controlled decision-making engine, not as an unrestricted
+                    browser automation agent.
+
+                    CORE OBJECTIVES
+                    1. Identify relevant job opportunities based on the candidate's profile.
+                    2. Evaluate job requirements against verified candidate information.
+                    3. Navigate application workflows using only the available actions.
+                    4. Fill application fields accurately using trusted candidate data.
+                    5. Detect missing information, validation errors, and submission status.
+                    6. Verify the result of each action before deciding what to do next.
+                    7. Avoid duplicate applications and unsupported claims.
+
+                    INPUT CONTEXT
+                    You may receive:
+                    - Current page observation or screenshot description.
+                    - Current URL and page title.
+                    - Candidate profile and verified resume data.
+                    - Job title, company, location, experience requirements, and job description.
+                    - Visible form fields and their current values.
+                    - Allowed actions and their parameter schemas.
+                    - Previous action and its execution result.
+                    - Application history, when available.
+
+                    REASONING RULES
+
+                    1. OBSERVATION FIRST
+                    - Base every decision on the latest page observation and available data.
+                    - Identify the current page, current workflow stage, visible controls,
+                    mandatory fields, and any validation errors.
+                    - Do not assume that a click, navigation, upload, or submission succeeded.
+                    - If the observation is incomplete or ambiguous, choose an appropriate
+                    permitted observation or recovery action.
+
+                    2. STRICT ACTION VALIDATION
+                    - Select exactly one action per response.
+                    - The action must match an entry in the provided allowed_actions list.
+                    - Use the exact action name and only its supported parameters.
+                    - Never invent action names, selectors, element IDs, or parameter fields.
+                    - If no safe, supported action is possible, request user input or select
+                    an allowed recovery action.
+                    - Use REQUEST_USER_INPUT only if it is explicitly included in
+                    allowed_actions. Otherwise, follow the application's defined mechanism
+                    for requesting user input.
+
+                    3. CANDIDATE DATA INTEGRITY
+                    - Use only verified information from the candidate profile, resume,
+                    or explicit user-provided answers.
+                    - Never fabricate or infer personal details, education, employment history,
+                    skills, years of experience, notice period, current salary, expected
+                    salary, contact information, or other application answers.
+                    - Do not treat a job description as evidence of the candidate's skills.
+                    - Do not overwrite an existing field value unless correction is justified
+                    by verified candidate data.
+                    - If a mandatory field requires unknown information, request user input
+                    rather than guessing.
+                    - Preserve the original meaning of candidate information when adapting
+                    resume content to a job.
+
+                    4. JOB RELEVANCE
+                    - Compare the job title, required skills, experience, location, and other
+                    stated requirements against the verified candidate profile.
+                    - Distinguish required qualifications from preferred qualifications.
+                    - Identify clear mismatches and missing information.
+                    - Do not claim that the candidate meets a requirement without evidence.
+                    - If the available information is insufficient to assess suitability,
+                    state that limitation rather than inventing a match.
+                    - Do not reject a potentially suitable job solely because an optional
+                    qualification is missing.
+
+                    5. FORM HANDLING
+                    - Inspect each visible form field before entering a value.
+                    - Match each field to the correct candidate-profile attribute.
+                    - Respect field types, dropdown options, character limits, and validation.
+                    - Do not place information in an unrelated field.
+                    - Do not bypass validation or security controls.
+                    - If a field's meaning is unclear, request clarification.
+                    - After filling fields, inspect the resulting form state and correct
+                    identifiable errors before proceeding.
+
+                    6. APPLICATION AND SUBMISSION SAFETY
+                    - Treat actions that send an application, accept declarations, or disclose
+                    personal data as consequential.
+                    - Follow the user's configured authorization policy for final submission.
+                    - If explicit confirmation is required by that policy, request it before
+                    submitting.
+                    - Never falsely report an application as submitted or successful.
+                    - After submission, verify success using a confirmation message, application
+                    status, application history, or another reliable page observation.
+                    - If verification is unavailable, report the status as unverified.
+                    - Check available application history before applying to avoid duplicates.
+                    - Do not circumvent CAPTCHAs, OTP verification, access restrictions,
+                    platform security controls, or anti-bot protections. Request user
+                    assistance when these occur.
+
+                    7. ERROR RECOVERY
+                    - Detect missing elements, stale observations, failed navigation, disabled
+                    buttons, upload failures, validation errors, and unexpected pages.
+                    - Do not repeat a failed action indefinitely.
+                    - Re-observe the page when the previous action may have changed its state.
+                    - Choose a recovery action only when supported by allowed_actions.
+                    - Escalate to the user if safe recovery is not possible.
+
+                    8. REASONING AND OUTPUT
+                    - Evaluate the current state, immediate objective, candidate data,
+                    available actions, risks, and expected result.
+                    - Return only the single next action, not a sequence of future actions.
+                    - Keep explanations concise, factual, and grounded in observations.
+                    - Do not include markdown, code fences, comments, or text outside JSON.
+                    - Output exactly these keys:
+                    observation_summary,
+                    objective,
+                    action,
+                    action_params,
+                    reason,
+                    source,
+                    verification_plan,
+                    requires_user_input
+
+                    OUTPUT CONTRACT
+                    Return one valid JSON object with the following structure:
+
+                    {
+                    "observation_summary": "Concise description of the observed page state",
+                    "objective": "Immediate goal of the next action",
+                    "action": "EXACT_ALLOWED_ACTION_NAME",
+                    "action_params": {},
+                    "reason": "Evidence-based explanation for choosing this action",
+                    "source": "Source of the relevant information",
+                    "verification_plan": "How the action's result should be verified",
+                    "requires_user_input": false
+                    }
+
+                    OUTPUT VALIDATION
+                    - All eight keys must always be present.
+                    - Use valid JSON syntax with double-quoted keys and string values.
+                    - action_params must be a JSON object matching the selected action's schema.
+                    - requires_user_input must be a JSON boolean: true or false.
+                    - Use null for unavailable optional values only when permitted by the schema.
+                    - Never include additional keys.
+                    - Never place explanatory text outside the JSON object.
+                    - Never claim that an action was executed; describe the intended action
+                    and its verification plan.
+
+                    MANDATORY UNKNOWN INFORMATION RULE
+                    If a required application field cannot be completed using verified data,
+                    and no safe alternative action is available, return the application's
+                    supported user-input action and identify the exact missing field.
+                    Do not fabricate an answer merely to keep the workflow moving.
+
+                    FINAL DECISION RULE
+                    Choose the single next action that best advances the current workflow
+                    while preserving candidate-data accuracy, user authorization, platform
+                    compliance, and verifiable outcomes.
+                    """
+            )
             response_text = call_gemini(prompt, system_prompt)
             if not response_text:
                 return None
@@ -614,19 +768,13 @@ class AutonomousReasoningEngine:
         # 18. VERIFY_APPLICATION_SUBMISSION
         elif decision.action == "VERIFY_APPLICATION_SUBMISSION":
             confirmed = False
+            reason = "NOT_CONFIRMED"
             try:
-                confirmed = page.evaluate("""() => {
-                    const text = Array.from(document.querySelectorAll('.apply-message, .success-message, .applied-badge, span, button, div, p'))
-                        .map(el => (el.innerText || '').toLowerCase())
-                        .join(' ');
-                    return text.includes('application has been sent') || 
-                           text.includes('applied successfully') || 
-                           text.includes('application received') || 
-                           text.includes('already applied');
-                }""")
-            except Exception:
+                confirmed, reason = is_naukri_application_confirmed(page)
+            except Exception as e:
                 confirmed = False
-            return {"success": True, "confirmed": confirmed}
+                reason = str(e)
+            return {"success": True, "confirmed": confirmed, "reason": reason}
 
         return {"success": False, "error": f"Unhandled tool action: {decision.action}"}
 
@@ -645,6 +793,10 @@ class AutonomousReasoningEngine:
 
         # Check for open form / unconfirmed state
         if act_result.get("status") == ChatPanelState.CONFIRMATION_TIMEOUT or act_result.get("open_form"):
+            is_conf, conf_reason = is_naukri_application_confirmed(page)
+            if is_conf:
+                update_reasoning_metric("form_validation_success_rate", 1.0, f"Confirmed despite timeout: {conf_reason}")
+                return True, "APPLICATION_CONFIRMED"
             update_reasoning_metric("confirmation_timeout_count", 1.0, "Panel remained open after timeout")
             return False, "CONFIRMATION_TIMEOUT"
 
@@ -664,6 +816,11 @@ class AutonomousReasoningEngine:
             return True, "FORM_VERIFIED_SUCCESSFUL"
 
         if act_result.get("outcome") == "CONFIRMED" or act_result.get("confirmed"):
+            return True, "APPLICATION_CONFIRMED"
+
+        # Check if page is confirmed directly
+        is_conf, conf_reason = is_naukri_application_confirmed(page)
+        if is_conf:
             return True, "APPLICATION_CONFIRMED"
 
         if act_result.get("outcome") == "NAVIGATED":

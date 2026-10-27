@@ -45,6 +45,7 @@ from question_answering import (
 )
 from chat_panel_handler import naukri_chat_panel_handler, ChatPanelState
 from reasoning_engine import reasoning_engine, AutonomousReasoningEngine
+from button_service import button_service, is_naukri_application_confirmed
 
 class ApplicationStatus:
     JOB_FOUND = "JOB_FOUND"
@@ -329,20 +330,45 @@ def detect_naukri_action_button(page):
       - 'DIRECT_APPLY'
       - None (if no action button is detected)
     """
+    # 0. Check for Apply Confirmation URL/Title (e.g. saveApply or ACP)
+    if page and not page.is_closed():
+        try:
+            url = (page.url or "").lower()
+            title = (page.title() or "").lower()
+            if "saveapply" in url or "myapply" in url or "apply confirmation" in title:
+                return ("ALREADY_APPLIED", None)
+        except Exception:
+            pass
+
     # 1. Check for Already Applied indicator
     already_applied_locators = [
         "button:has-text('Applied')",
         "span:has-text('Applied')",
+        "a:has-text('Applied')",
+        "#already-applied",
+        "span#already-applied",
+        "button#already-applied",
+        "a#already-applied",
         ".applied-badge",
         ".already-applied",
-        "div:has-text('already applied')"
+        "div:has-text('already applied')",
+        "a:has-text('already applied')",
+        "div:has-text('Applied to')",
+        "div:has-text('Applied on')",
+        "p:has-text('Applied on')",
+        "span:has-text('Applied on')",
+        "div[class*='already-applied']",
+        "span[class*='already-applied']",
+        "div[class*='apply-button-container']:has-text('Applied')",
+        ".acp-container",
+        ".acp-header-container"
     ]
     for sel in already_applied_locators:
         try:
             el = page.query_selector(sel)
             if el and el.is_visible():
                 txt = (el.inner_text() or "").lower()
-                if "applied" in txt:
+                if "applied" in txt or "already-applied" in sel or "acp-" in sel:
                     return ("ALREADY_APPLIED", el)
         except Exception:
             pass
@@ -585,6 +611,11 @@ def handle_naukri_screening_drawer(detail_tab, stop_event: threading.Event, comp
     if not agent_config_manager.is_authorized("auto_answer_screening"):
         bot_state.add_log("Screening drawer detected, but auto_answer_screening is disabled by config. Tab kept OPEN for review.", "INFO")
         return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "reason": "AUTO_ANSWER_SCREENING_NOT_AUTHORIZED"}
+
+    # 0.1 Check if application was already confirmed (e.g. 1-click apply navigated to saveApply or ACP)
+    is_conf, conf_reason = is_naukri_application_confirmed(detail_tab)
+    if is_conf:
+        return {"status": ApplicationStatus.APPLICATION_CONFIRMED, "success": True, "reason": conf_reason}
 
     # 1. PRIORITY: Check for Dedicated Right-Side Chat Panel (Naukri chatbot / screening drawer)
     chat_panel = naukri_chat_panel_handler.detect_chat_panel(detail_tab)
@@ -1176,6 +1207,9 @@ def process_job_application(context, search_page, title: str, company: str, loc_
             bot_state.add_log(f"⚡ Direct Apply button detected for {title} @ {company}. Clicking Apply...", "INFO")
             bot_state.current_job["stage"] = ApplicationStatus.APPLY_CLICKED
 
+            confirmed = False
+            failure_reason = ""
+
             pages_before = len(context.pages)
             new_tab_opened = None
             try:
@@ -1193,20 +1227,30 @@ def process_job_application(context, search_page, title: str, company: str, loc_
 
             human_sleep(2.5, 4.0, stop_event)
 
-            # SUBCASE 2A: Clicking Apply opened an external tab (e.g. Capgemini)
+            # SUBCASE 2A: Clicking Apply opened a new tab
             if new_tab_opened and new_tab_opened != detail_tab:
-                bot_state.add_log(f"🌐 Clicking Apply opened external portal in new tab for {company}!", "INFO")
-                company_tab = new_tab_opened
-                company_tab.bring_to_front()
-                try:
-                    company_tab.wait_for_load_state("domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                return handle_external_company_portal(
-                    context=context, detail_tab=detail_tab, company_tab=company_tab,
-                    title=title, company=company, loc_text=loc_text, exp_text=exp_text,
-                    score=score, stop_event=stop_event
-                )
+                # Check if new tab is a Naukri confirmation page (e.g. saveApply or ACP)
+                is_conf, conf_reason = is_naukri_application_confirmed(new_tab_opened)
+                if is_conf:
+                    bot_state.add_log(f"🎉 Direct Apply confirmation detected in new tab for {company} ({conf_reason})!", "SUCCESS")
+                    try:
+                        new_tab_opened.close()
+                    except Exception:
+                        pass
+                    confirmed = True
+                elif "naukri.com" not in new_tab_opened.url.lower():
+                    bot_state.add_log(f"🌐 Clicking Apply opened external portal in new tab for {company}!", "INFO")
+                    company_tab = new_tab_opened
+                    company_tab.bring_to_front()
+                    try:
+                        company_tab.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    return handle_external_company_portal(
+                        context=context, detail_tab=detail_tab, company_tab=company_tab,
+                        title=title, company=company, loc_text=loc_text, exp_text=exp_text,
+                        score=score, stop_event=stop_event
+                    )
 
             # SUBCASE 2B: Clicking Apply redirected detail_tab to external site (not naukri.com)
             if "naukri.com" not in detail_tab.url.lower():
@@ -1237,98 +1281,137 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                 cooldown_timer(min_sec=bot_state.config.unconfirmed_cooldown_min_sec, max_sec=bot_state.config.unconfirmed_cooldown_max_sec, stop_event=stop_event, reason=f"Login required for {company}")
                 return {"status": ApplicationStatus.APPLICATION_FAILED, "success": False, "failure_reason": "LOGIN_REQUIRED", "attempted": True}
 
-            # Answer screening questions drawer / chatbot
-            bot_state.current_job["stage"] = ApplicationStatus.FORM_OPENED
-            confirmed = False
-            failure_reason = ""
-            drawer_res = handle_naukri_screening_drawer(detail_tab, stop_event, company=company, title=title)
+            # Check if detail_tab itself already navigated to confirmation (e.g. saveApply)
+            if not confirmed:
+                is_conf, conf_reason = is_naukri_application_confirmed(detail_tab)
+                if is_conf:
+                    confirmed = True
+                    bot_state.add_log(f"🎉 Direct Apply confirmation detected for {company} ({conf_reason})!", "SUCCESS")
 
-            if isinstance(drawer_res, dict):
-                if drawer_res.get("status") == ApplicationStatus.NEEDS_USER_INPUT:
-                    reason = drawer_res.get("reason", "NEEDS_USER_INPUT")
-                    unanswered = drawer_res.get("unanswered_question", "")
-                    bot_state.add_log(f"⚠️ [NEEDS_USER_INPUT] Screening questionnaire for {company} needs candidate input: '{unanswered[:30]}' ({reason}). Tab kept OPEN in Chrome!", "WARNING")
-                    detail_tab.bring_to_front()
-                    record_application(
-                        job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
-                        status=ApplicationStatus.NEEDS_USER_INPUT, apply_type='DIRECT_NAUKRI', match_score=score,
-                        notes=f"Screening question requires user input: {reason}. Question: {unanswered}. Tab kept open in Chrome.",
-                        failure_reason=reason,
-                        experience_req=exp_text
-                    )
-                    return {"status": ApplicationStatus.NEEDS_USER_INPUT, "success": False, "failure_reason": reason, "attempted": True}
-                elif drawer_res.get("status") in [ApplicationStatus.CONFIRMATION_TIMEOUT, ChatPanelState.CONFIRMATION_TIMEOUT] or drawer_res.get("open_form"):
-                    reason = drawer_res.get("failure_reason", "CONFIRMATION_TIMEOUT")
-                    unanswered = drawer_res.get("unanswered_question", "")
-                    bot_state.add_log(f"⚠️ Application questionnaire remained open or timed out for {company} (Question: '{unanswered[:30]}'). Tab kept OPEN in Chrome!", "WARNING")
-                    detail_tab.bring_to_front()
-                    record_application(
-                        job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
-                        status=ApplicationStatus.APPLICATION_FAILED, apply_type='DIRECT_NAUKRI', match_score=score,
-                        notes=f"Questionnaire open/timed out: {reason}. Unanswered question: {unanswered}",
-                        failure_reason=reason,
-                        experience_req=exp_text
-                    )
-                    cooldown_timer(min_sec=bot_state.config.unconfirmed_cooldown_min_sec, max_sec=bot_state.config.unconfirmed_cooldown_max_sec, stop_event=stop_event, reason=f"Safety break after open form on {company}")
-                    return {"status": ApplicationStatus.APPLICATION_FAILED, "success": False, "failure_reason": reason, "attempted": True}
-                elif drawer_res.get("status") == ApplicationStatus.APPLICATION_PENDING_CONFIRMATION:
-                    reason = drawer_res.get("reason", "AUTO_SUBMIT_DIRECT_NOT_AUTHORIZED")
-                    bot_state.add_log(f"Screening completed for {company}. Auto-submit not authorized. Tab kept OPEN for review.", "INFO")
-                    detail_tab.bring_to_front()
-                    record_application(
-                        job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
-                        status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='DIRECT_NAUKRI', match_score=score,
-                        notes="Screening completed. Auto-submit not authorized. Tab kept open.",
-                        failure_reason=reason,
-                        experience_req=exp_text
-                    )
-                    return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "success": False, "failure_reason": reason, "attempted": True}
-                elif drawer_res.get("status") in [ApplicationStatus.APPLICATION_CONFIRMED, ChatPanelState.APPLICATION_CONFIRMED]:
-                    confirmed = True
-                elif drawer_res.get("status") == ChatPanelState.FORM_COMPLETED and drawer_res.get("success"):
-                    confirmed = True
+            # Answer screening questions drawer / chatbot
+            if not confirmed:
+                bot_state.current_job["stage"] = ApplicationStatus.FORM_OPENED
+                drawer_res = handle_naukri_screening_drawer(detail_tab, stop_event, company=company, title=title)
+
+                if isinstance(drawer_res, dict):
+                    if drawer_res.get("status") == ApplicationStatus.NEEDS_USER_INPUT:
+                        reason = drawer_res.get("reason", "NEEDS_USER_INPUT")
+                        unanswered = drawer_res.get("unanswered_question", "")
+                        bot_state.add_log(f"⚠️ [NEEDS_USER_INPUT] Screening questionnaire for {company} needs candidate input: '{unanswered[:30]}' ({reason}). Tab kept OPEN in Chrome!", "WARNING")
+                        detail_tab.bring_to_front()
+                        record_application(
+                            job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
+                            status=ApplicationStatus.NEEDS_USER_INPUT, apply_type='DIRECT_NAUKRI', match_score=score,
+                            notes=f"Screening question requires user input: {reason}. Question: {unanswered}. Tab kept open in Chrome.",
+                            failure_reason=reason,
+                            experience_req=exp_text
+                        )
+                        return {"status": ApplicationStatus.NEEDS_USER_INPUT, "success": False, "failure_reason": reason, "attempted": True}
+                    elif drawer_res.get("status") in [ApplicationStatus.CONFIRMATION_TIMEOUT, ChatPanelState.CONFIRMATION_TIMEOUT] or drawer_res.get("open_form"):
+                        # Double-check if page actually reached confirmation despite timeout
+                        is_conf, conf_reason = is_naukri_application_confirmed(detail_tab)
+                        if is_conf:
+                            confirmed = True
+                            bot_state.add_log(f"🎉 Application confirmed for {company} ({conf_reason})!", "SUCCESS")
+                        else:
+                            reason = drawer_res.get("failure_reason", "CONFIRMATION_TIMEOUT")
+                            unanswered = drawer_res.get("unanswered_question", "")
+                            bot_state.add_log(f"⚠️ Application questionnaire remained open or timed out for {company} (Question: '{unanswered[:30]}'). Tab kept OPEN in Chrome!", "WARNING")
+                            detail_tab.bring_to_front()
+                            record_application(
+                                job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
+                                status=ApplicationStatus.APPLICATION_FAILED, apply_type='DIRECT_NAUKRI', match_score=score,
+                                notes=f"Questionnaire open/timed out: {reason}. Unanswered question: {unanswered}",
+                                failure_reason=reason,
+                                experience_req=exp_text
+                            )
+                            cooldown_timer(min_sec=bot_state.config.unconfirmed_cooldown_min_sec, max_sec=bot_state.config.unconfirmed_cooldown_max_sec, stop_event=stop_event, reason=f"Safety break after open form on {company}")
+                            return {"status": ApplicationStatus.APPLICATION_FAILED, "success": False, "failure_reason": reason, "attempted": True}
+                    elif drawer_res.get("status") == ApplicationStatus.APPLICATION_PENDING_CONFIRMATION:
+                        reason = drawer_res.get("reason", "AUTO_SUBMIT_DIRECT_NOT_AUTHORIZED")
+                        bot_state.add_log(f"Screening completed for {company}. Auto-submit not authorized. Tab kept OPEN for review.", "INFO")
+                        detail_tab.bring_to_front()
+                        record_application(
+                            job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
+                            status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='DIRECT_NAUKRI', match_score=score,
+                            notes="Screening completed. Auto-submit not authorized. Tab kept open.",
+                            failure_reason=reason,
+                            experience_req=exp_text
+                        )
+                        return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "success": False, "failure_reason": reason, "attempted": True}
+                    elif drawer_res.get("status") in [ApplicationStatus.APPLICATION_CONFIRMED, ChatPanelState.APPLICATION_CONFIRMED]:
+                        confirmed = True
+                    elif drawer_res.get("status") == ChatPanelState.FORM_COMPLETED and drawer_res.get("success"):
+                        confirmed = True
 
             bot_state.current_job["stage"] = ApplicationStatus.FORM_SUBMITTED
 
-            # Verify Success with reliable polling (up to 8 seconds)
+            # Verify Success with reliable condition-based polling (up to 8 seconds)
             if not confirmed:
                 start_verify = time.time()
                 while time.time() - start_verify < 8.0:
                     if stop_event and stop_event.is_set():
                         break
 
-                    # 1. Page-level success elements
+                    # 1. Comprehensive confirmation check on detail_tab
+                    is_conf, conf_reason = is_naukri_application_confirmed(detail_tab)
+                    if is_conf:
+                        confirmed = True
+                        bot_state.add_log(f"🎉 Application confirmed for {company} ({conf_reason})!", "SUCCESS")
+                        break
+
+                    # 2. Check all open pages in context in case saveApply opened in another tab
                     try:
-                        success_indicator = detail_tab.locator(".apply-message, .success-message, .applied-badge, span:has-text('Applied'), button:has-text('Applied')")
-                        if success_indicator.count() > 0 and any(success_indicator.nth(i).is_visible() for i in range(success_indicator.count())):
-                            confirmed = True
-                            break
+                        for p in context.pages:
+                            if p != detail_tab and not p.is_closed():
+                                p_conf, p_reason = is_naukri_application_confirmed(p)
+                                if p_conf:
+                                    confirmed = True
+                                    bot_state.add_log(f"🎉 Confirmation detected in tab {p.title()[:25]} ({p_reason})!", "SUCCESS")
+                                    try:
+                                        p.close()
+                                    except Exception:
+                                        pass
+                                    break
                     except Exception:
                         pass
 
-                    # 2. Chatbot drawer success message
-                    chatbot_status = detail_tab.evaluate("""() => {
-                        const text = Array.from(document.querySelectorAll('.botMsg, .chatContent, div[class*="botMsg"], div[class*="chatMsg"], .bot-row, p.msg, div.apply-message, .success-title'))
-                            .map(el => (el.innerText || '').toLowerCase())
-                            .join(' ');
-                        const hasSuccess = text.includes('application has been sent') || 
-                                          text.includes('applied successfully') || 
-                                          text.includes('application received') || 
-                                          text.includes('thank you for applying') ||
-                                          text.includes('applied on') ||
-                                          text.includes('already applied');
-                        const hasErr = Array.from(document.querySelectorAll('.error, .alert-danger, .invalid-feedback'))
-                            .some(e => e.offsetParent !== null && (e.innerText || '').trim().length > 0);
-                        return { confirmed: hasSuccess, hasErrors: hasErr };
-                    }""")
-                    if chatbot_status.get("confirmed"):
-                        confirmed = True
-                        break
-                    if chatbot_status.get("hasErrors"):
-                        failure_reason = "VALIDATION_ERROR"
+                    if confirmed:
                         break
 
-                    time.sleep(1.0)
+                    # 3. Check for visible validation errors
+                    has_val_err = detail_tab.evaluate("""() => {
+                        const errEls = Array.from(document.querySelectorAll('.error, .alert-danger, .invalid-feedback'))
+                            .filter(e => e.offsetParent !== null && (e.innerText || '').trim().length > 0);
+                        return errEls.length > 0 ? errEls[0].innerText.trim() : null;
+                    }""")
+                    if has_val_err:
+                        failure_reason = f"VALIDATION_ERROR: {has_val_err}"
+                        break
+
+                    # 4. Check action button state directly
+                    act_t, _ = detect_naukri_action_button(detail_tab)
+                    if act_t == "ALREADY_APPLIED":
+                        confirmed = True
+                        bot_state.add_log(f"🎉 Application confirmed via button state for {company}!", "SUCCESS")
+                        break
+
+                    # 5. Fallback reload at 4s if no active questionnaire is present
+                    if time.time() - start_verify > 4.0:
+                        has_chat = naukri_chat_panel_handler.detect_chat_panel(detail_tab)
+                        if not has_chat:
+                            try:
+                                detail_tab.reload(wait_until="domcontentloaded")
+                                time.sleep(1.0)
+                                is_conf_reload, r_reason = is_naukri_application_confirmed(detail_tab)
+                                if is_conf_reload:
+                                    confirmed = True
+                                    bot_state.add_log(f"🎉 Application confirmed after refresh for {company} ({r_reason})!", "SUCCESS")
+                                    break
+                            except Exception:
+                                pass
+
+                    time.sleep(0.8)
 
             # CRITICAL VERIFICATION: Ensure no open questionnaire panel remains before confirming
             try:
@@ -1372,8 +1455,14 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                 has_open_form = False
                 try:
                     has_open_form = detail_tab.evaluate("""() => {
-                        const inps = Array.from(document.querySelectorAll('input:not([type="hidden"]), select, textarea, .chatbot_drawer, .bot-container'));
-                        return inps.some(i => i.offsetParent !== null);
+                        const formContainers = Array.from(document.querySelectorAll(
+                            '.chatbot_drawer, .drawer-wrapper, .bot-container, div[class*="chatbot"], div[class*="drawer"], div[class*="apply-modal"], div[class*="applyModal"], div[class*="screening"], div[class*="questionnaire"], div[role="dialog"], .apply-dialog, .modal-content, .custom-questions'
+                        )).filter(c => c.offsetParent !== null && window.getComputedStyle(c).display !== 'none');
+                        if (formContainers.length === 0) return false;
+                        return formContainers.some(c => {
+                            const inputs = Array.from(c.querySelectorAll('input:not([type="hidden"]), select, textarea'));
+                            return inputs.some(i => i.offsetParent !== null && !i.disabled);
+                        });
                     }""")
                 except Exception:
                     pass

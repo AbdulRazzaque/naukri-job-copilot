@@ -70,6 +70,9 @@ def classify_question_category(question: str) -> str:
     if any(k in q for k in ["ctc", "salary", "compensation", "fixed component", "inr", "lakh", "lpa", "earning"]):
         return QuestionCategory.SALARY
 
+    if any(k in q for k in ["which backend", "which technology", "which skill", "which framework", "which language", "strongest hands-on", "hands-on experience in:", "backend technology"]):
+        return QuestionCategory.TECHNICAL_SKILLS
+
     if any(k in q for k in ["experience", "exp", "years", "total exp", "how many years", "relevant"]):
         return QuestionCategory.EXPERIENCE
 
@@ -237,6 +240,11 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
 
     # --- CATEGORY: TECHNICAL SKILLS ---
     if category == QuestionCategory.TECHNICAL_SKILLS:
+        # Choice questions: "Which backend technology do you have the strongest hands-on experience in: Golang or Node.js?"
+        if any(k in q for k in ["which backend", "backend technology", "golang or node", "node or golang", "node.js or golang", "golang or node.js"]):
+            return ("Node.js", "CANDIDATE_PROFILE", "Strongest Backend Technology (Node.js)")
+        if any(k in q for k in ["frontend technology", "react or angular", "angular or react"]):
+            return ("React.js", "CANDIDATE_PROFILE", "Strongest Frontend Technology (React.js)")
         if any(k in q for k in ["primary skill", "primary technology", "core skill", "key skill", "primary"]):
             return (profile.get("primary_skills", "React.js, Node.js, MERN Stack, TypeScript"), "CANDIDATE_PROFILE", "Primary Skills")
         if any(q.startswith(p) for p in ["do you", "have you", "are you"]):
@@ -401,9 +409,36 @@ def match_best_option(answer: str, options: List[Dict[str, str]], category: str)
         if match:
             return match
 
+    # RELOCATION & LOCATION
+    if category in [QuestionCategory.RELOCATION, QuestionCategory.LOCATION] or "mumbai" in ans_low or ans_low in ["yes", "true"]:
+        loc_terms = [
+            "currently residing in mumbai", "residing in mumbai", "reside in mumbai",
+            "i currently reside in mumbai", "mumbai", "kurla", "willing to relocate to mumbai",
+            "open to relocate to mumbai", "willing to relocate", "open to relocate", "relocate",
+            "yes", "yes, residing", "yes, willing", "both", "agree"
+        ]
+        for term in loc_terms:
+            match = next((o for o in valid_opts if term == o["text"].lower().strip() or term in o["text"].lower() or term in o["value"].lower()), None)
+            if match:
+                return match
+
+    # TECHNICAL SKILLS
+    if category == QuestionCategory.TECHNICAL_SKILLS:
+        if any(k in ans_low for k in ["node", "node.js", "nodejs"]):
+            match = next((o for o in valid_opts if any(k in o["text"].lower() or k in o["value"].lower() for k in ["node.js", "nodejs", "node js", "node"])), None)
+            if match:
+                return match
+        if any(k in ans_low for k in ["react", "react.js", "reactjs"]):
+            match = next((o for o in valid_opts if any(k in o["text"].lower() or k in o["value"].lower() for k in ["react.js", "reactjs", "react js", "react"])), None)
+            if match:
+                return match
+
     # YES / NO
     if ans_low in ["yes", "true", "agree", "positive"]:
-        match = next((o for o in valid_opts if any(k == o["text"].lower().strip() or o["text"].lower().startswith(k) for k in ["yes", "agree", "confirm", "comfortable", "i agree"])), None)
+        match = next((o for o in valid_opts if any(
+            k == o["text"].lower().strip() or o["text"].lower().startswith(k) or k in o["text"].lower()
+            for k in ["yes", "agree", "confirm", "comfortable", "i agree", "residing", "willing"]
+        )), None)
         if match:
             return match
 
