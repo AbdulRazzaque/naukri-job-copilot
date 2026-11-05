@@ -36,8 +36,13 @@ export default function Dashboard() {
   
   // Controls Form
   const [keyword, setKeyword] = useState('All Target Roles (Auto-Cycle)');
-  const [location, setLocation] = useState('Mumbai');
+  const [location, setLocation] = useState('Dubai, Qatar, Mumbai, Pune, Remote');
+  const [naukriLocations, setNaukriLocations] = useState('Mumbai, Pune, Remote');
+  const [linkedinLocations, setLinkedinLocations] = useState('Dubai, Qatar, Mumbai, Pune, Remote');
+  const [naukrigulfLocations, setNaukrigulfLocations] = useState('Qatar, Dubai, UAE, Saudi Arabia, Remote');
   const [experience, setExperience] = useState(5);
+  const [platform, setPlatform] = useState('ALL'); // 'ALL' | 'NAUKRI' | 'LINKEDIN' | 'NAUKRIGULF'
+  const [platformFilter, setPlatformFilter] = useState('ALL'); // 'ALL' | 'NAUKRI' | 'LINKEDIN' | 'NAUKRIGULF'
   const [loadingAction, setLoadingAction] = useState(false);
   const [profileModal, setProfileModal] = useState(false);
   const [profileData, setProfileData] = useState(null);
@@ -166,10 +171,19 @@ export default function Dashboard() {
   const handleStart = async () => {
     setLoadingAction(true);
     try {
+      const activeLoc = platform === 'NAUKRI' ? naukriLocations : platform === 'LINKEDIN' ? linkedinLocations : platform === 'NAUKRIGULF' ? naukrigulfLocations : `${naukriLocations}, ${linkedinLocations}, ${naukrigulfLocations}`;
       const res = await fetch('/api/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keyword, location, experience: parseInt(experience) })
+        body: JSON.stringify({ 
+          keyword, 
+          location: activeLoc,
+          naukri_locations: naukriLocations,
+          linkedin_locations: linkedinLocations,
+          naukrigulf_locations: naukrigulfLocations,
+          experience: parseInt(experience), 
+          platform 
+        })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -199,9 +213,15 @@ export default function Dashboard() {
   const filteredApps = applications.filter(app => {
     const matchesSearch = 
       app.job_title?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      app.company_name?.toLowerCase().includes(searchTerm.toLowerCase());
+      app.company_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      (app.location && app.location.toLowerCase().includes(searchTerm.toLowerCase()));
 
     if (!matchesSearch) return false;
+
+    // Platform filter
+    const appPlatform = (app.platform || 'NAUKRI').toUpperCase();
+    if (platformFilter !== 'ALL' && appPlatform !== platformFilter) return false;
+
     if (activeTab === 'ALL') return true;
     if (activeTab === 'APPLIED') return app.status === 'APPLIED' || app.status === 'APPLICATION_CONFIRMED';
     if (activeTab === 'REDIRECT_REVIEW') return app.status === 'REDIRECT_REVIEW' || app.status === 'APPLICATION_PENDING_CONFIRMATION';
@@ -226,13 +246,16 @@ export default function Dashboard() {
             <Sparkles className="w-6 h-6" />
           </div>
           <div>
-            <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-bold tracking-tight text-white">Naukri AI Job Copilot</h1>
+            <div className="flex items-center gap-3 flex-wrap">
+              <h1 className="text-2xl font-bold tracking-tight text-white">Multi-Platform Job Copilot</h1>
               <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-1">
-                <Sparkles className="w-3 h-3 text-emerald-400" /> Autonomous Mode: Active
+                <Sparkles className="w-3 h-3 text-emerald-400" /> Autonomous
               </span>
-              <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-teal-500/10 text-teal-400 border border-teal-500/20">
-                100% Anti-Ban
+              <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center gap-1">
+                🔷 Naukri.com + 🟦 LinkedIn
+              </span>
+              <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                📍 Mumbai &amp; Qatar
               </span>
             </div>
             <p className="text-sm text-slate-400">
@@ -301,41 +324,65 @@ export default function Dashboard() {
 
         {/* Top 4 Metrics Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {/* Card 1: Daily Safe Quota */}
+          {/* Card 1: Daily Safe Quotas */}
           <div className="glass-card p-5 rounded-2xl relative overflow-hidden">
             <div className="flex items-center justify-between text-slate-400">
-              <span className="text-xs font-semibold uppercase tracking-wider">Today's Safe Quota</span>
+              <span className="text-xs font-semibold uppercase tracking-wider">Today's Platform Quotas</span>
               <Shield className="w-4 h-4 text-teal-400" />
             </div>
             <div className="mt-2 flex items-baseline gap-2">
-              <span className="text-3xl font-extrabold text-white">{stats.today_applied}</span>
-              <span className="text-sm text-slate-400 font-medium">/ 45 Limit</span>
+              <span className="text-2xl font-extrabold text-white">{stats.today_applied || 0}</span>
+              <span className="text-xs text-slate-400 font-medium">/ 135 Safe Total</span>
             </div>
-            {/* Progress bar */}
-            <div className="mt-3 w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-              <div 
-                className="bg-gradient-to-r from-teal-500 to-emerald-400 h-full rounded-full transition-all duration-500"
-                style={{ width: `${Math.min(100, (stats.today_applied / 45) * 100)}%` }}
-              />
+            {/* Separate Platform Progress Badges (45 Quota Each) */}
+            <div className="mt-3 space-y-2 text-[11px]">
+              <div>
+                <div className="flex justify-between items-center text-slate-300 mb-0.5">
+                  <span className="flex items-center gap-1 text-cyan-400 font-medium"><span>🔷</span> Naukri</span>
+                  <span className="font-mono font-semibold">{stats.today_naukri || 0} / 45</span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1 overflow-hidden">
+                  <div className="bg-cyan-400 h-full rounded-full transition-all duration-500" style={{ width: `${Math.min(100, ((stats.today_naukri || 0) / 45) * 100)}%` }} />
+                </div>
+              </div>
+
+              <div>
+                <div className="flex justify-between items-center text-slate-300 mb-0.5">
+                  <span className="flex items-center gap-1 text-blue-400 font-medium"><span>🟦</span> LinkedIn</span>
+                  <span className="font-mono font-semibold">{stats.today_linkedin || 0} / 45</span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1 overflow-hidden">
+                  <div className="bg-blue-400 h-full rounded-full transition-all duration-500" style={{ width: `${Math.min(100, ((stats.today_linkedin || 0) / 45) * 100)}%` }} />
+                </div>
+              </div>
+
+              <div>
+                <div className="flex justify-between items-center text-slate-300 mb-0.5">
+                  <span className="flex items-center gap-1 text-emerald-400 font-medium"><span>🌐</span> NaukriGulf</span>
+                  <span className="font-mono font-semibold">{stats.today_naukrigulf || 0} / 45</span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1 overflow-hidden">
+                  <div className="bg-emerald-400 h-full rounded-full transition-all duration-500" style={{ width: `${Math.min(100, ((stats.today_naukrigulf || 0) / 45) * 100)}%` }} />
+                </div>
+              </div>
             </div>
-            <p className="mt-2 text-xs text-slate-400">
-              {stats.remaining_today > 0 
-                ? `${stats.remaining_today} slots remaining today` 
-                : '✅ Safe daily limit reached!'}
-            </p>
           </div>
 
           {/* Card 2: Total Applied */}
           <div className="glass-card p-5 rounded-2xl">
             <div className="flex items-center justify-between text-slate-400">
-              <span className="text-xs font-semibold uppercase tracking-wider">Direct Applied (All Time)</span>
+              <span className="text-xs font-semibold uppercase tracking-wider">Confirmed Submissions</span>
               <CheckCircle2 className="w-4 h-4 text-emerald-400" />
             </div>
             <div className="mt-2 flex items-baseline gap-2">
               <span className="text-3xl font-extrabold text-emerald-400">{stats.total_applied}</span>
-              <span className="text-xs text-slate-400">Jobs via Naukri</span>
+              <span className="text-xs text-slate-400">Total Confirmed</span>
             </div>
-            <p className="mt-3 text-xs text-slate-400">Recorded in MySQL database with timestamp</p>
+            <div className="mt-3 flex flex-col gap-1 text-[11px]">
+              <span className="text-cyan-400 font-medium">🔷 Naukri: {stats.naukri_applied ?? stats.total_applied}</span>
+              <span className="text-blue-400 font-medium">🟦 LinkedIn: {stats.linkedin_applied ?? 0}</span>
+              <span className="text-emerald-400 font-medium">🌐 NaukriGulf: {stats.naukrigulf_applied ?? 0}</span>
+            </div>
           </div>
 
           {/* Card 3: External Company Sites */}
@@ -389,6 +436,78 @@ export default function Dashboard() {
             </div>
 
             <div className="space-y-4">
+              {/* Target Platforms Option */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                    <Globe className="w-3.5 h-3.5 text-teal-400" />
+                    Target Job Boards
+                  </label>
+                  <span className="text-[10px] text-teal-400 font-medium">Multi-Platform</span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPlatform('ALL')}
+                    className={`py-2 px-2 rounded-xl border text-xs font-bold flex flex-col items-center justify-center gap-1 transition ${
+                      platform === 'ALL'
+                        ? 'bg-gradient-to-r from-teal-500/20 to-blue-500/20 border-teal-400 text-teal-200 shadow-md shadow-teal-500/10'
+                        : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                    }`}
+                  >
+                    <span className="flex items-center gap-1 text-[11px]">
+                      <span>🌐</span> All 3 Boards
+                    </span>
+                    <span className="text-[10px] font-normal text-slate-400">Naukri + LI + Gulf</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setPlatform('NAUKRI')}
+                    className={`py-2 px-2 rounded-xl border text-xs font-bold flex flex-col items-center justify-center gap-1 transition ${
+                      platform === 'NAUKRI'
+                        ? 'bg-cyan-500/20 border-cyan-400 text-cyan-200 shadow-md shadow-cyan-500/10'
+                        : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                    }`}
+                  >
+                    <span className="flex items-center gap-1 text-[11px]">
+                      <span>🔷</span> Naukri.com
+                    </span>
+                    <span className="text-[10px] font-normal text-slate-400">India (45 Quota)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setPlatform('LINKEDIN')}
+                    className={`py-2 px-2 rounded-xl border text-xs font-bold flex flex-col items-center justify-center gap-1 transition ${
+                      platform === 'LINKEDIN'
+                        ? 'bg-blue-500/20 border-blue-400 text-blue-200 shadow-md shadow-blue-500/10'
+                        : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                    }`}
+                  >
+                    <span className="flex items-center gap-1 text-[11px]">
+                      <span>🟦</span> LinkedIn
+                    </span>
+                    <span className="text-[10px] font-normal text-slate-400">Global (45 Quota)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setPlatform('NAUKRIGULF')}
+                    className={`py-2 px-2 rounded-xl border text-xs font-bold flex flex-col items-center justify-center gap-1 transition ${
+                      platform === 'NAUKRIGULF'
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 shadow-md shadow-emerald-500/10'
+                        : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                    }`}
+                  >
+                    <span className="flex items-center gap-1 text-[11px]">
+                      <span>🌐</span> NaukriGulf
+                    </span>
+                    <span className="text-[10px] font-normal text-slate-400">Gulf (45 Quota)</span>
+                  </button>
+                </div>
+              </div>
+
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-xs font-medium text-slate-300">Target Role / Positions</label>
@@ -439,24 +558,99 @@ export default function Dashboard() {
                 )}
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-medium text-slate-300 block mb-1.5">Target Location</label>
-                  <input 
-                    type="text" 
-                    value={location}
-                    onChange={(e) => setLocation(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-sm focus:border-teal-500 focus:outline-none transition"
-                    placeholder="Mumbai / Remote"
-                  />
-                </div>
-                <div>
+              {/* Location Controls Configured Per Platform */}
+              <div className="space-y-3">
+                {(platform === 'ALL' || platform === 'NAUKRI') && (
+                  <div className="p-3 rounded-xl bg-cyan-950/20 border border-cyan-500/20 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-cyan-300 flex items-center gap-1.5">
+                        <span>🔷</span> Naukri.com Locations
+                      </span>
+                      <span className="text-[10px] text-cyan-400 font-mono">India Only</span>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <input 
+                        type="text" 
+                        value={naukriLocations}
+                        onChange={(e) => setNaukriLocations(e.target.value)}
+                        className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs text-slate-200 focus:border-cyan-400 focus:outline-none transition"
+                        placeholder="Mumbai, Pune, Remote"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setNaukriLocations('Mumbai, Pune, Remote')}
+                        className="text-[10px] px-2 py-1 rounded bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/20"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400">Targeting: <strong>Mumbai</strong>, <strong>Pune</strong>, &amp; <strong>Remote</strong> (Gulf blocked on Naukri)</p>
+                  </div>
+                )}
+
+                {(platform === 'ALL' || platform === 'LINKEDIN') && (
+                  <div className="p-3 rounded-xl bg-blue-950/20 border border-blue-500/20 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-blue-300 flex items-center gap-1.5">
+                        <span>🟦</span> LinkedIn Locations
+                      </span>
+                      <span className="text-[10px] text-blue-400 font-mono">India + Qatar + Dubai</span>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <input 
+                        type="text" 
+                        value={linkedinLocations}
+                        onChange={(e) => setLinkedinLocations(e.target.value)}
+                        className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs text-slate-200 focus:border-blue-400 focus:outline-none transition"
+                        placeholder="Dubai, Qatar, Mumbai, Pune, Remote"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setLinkedinLocations('Dubai, Qatar, Mumbai, Pune, Remote')}
+                        className="text-[10px] px-2 py-1 rounded bg-blue-500/10 border border-blue-500/30 text-blue-300 hover:bg-blue-500/20"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400">Targeting: <strong>Pune</strong>, <strong>Mumbai</strong>, <strong>Qatar</strong>, &amp; <strong>Remote</strong> (Auto-attaches Qatar CV for Qatar)</p>
+                  </div>
+                )}
+
+                {(platform === 'ALL' || platform === 'NAUKRIGULF') && (
+                  <div className="p-3 rounded-xl bg-emerald-950/20 border border-emerald-500/20 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
+                        <span>🌐</span> NaukriGulf Locations
+                      </span>
+                      <span className="text-[10px] text-emerald-400 font-mono">Gulf / Middle East</span>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <input 
+                        type="text" 
+                        value={naukrigulfLocations}
+                        onChange={(e) => setNaukrigulfLocations(e.target.value)}
+                        className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs text-slate-200 focus:border-emerald-400 focus:outline-none transition"
+                        placeholder="Qatar, Dubai, UAE, Saudi Arabia, Remote"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setNaukrigulfLocations('Qatar, Dubai, UAE, Saudi Arabia, Remote')}
+                        className="text-[10px] px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/20"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400">Targeting: <strong>Qatar</strong>, <strong>Dubai</strong>, <strong>UAE</strong>, &amp; <strong>Saudi Arabia</strong> (Auto-uses Qatar Profile &amp; Resume)</p>
+                  </div>
+                )}
+
+                <div className="pt-1">
                   <label className="text-xs font-medium text-slate-300 block mb-1.5">Experience (Years)</label>
                   <input 
                     type="number" 
                     value={experience}
                     onChange={(e) => setExperience(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-sm focus:border-teal-500 focus:outline-none transition"
+                    className="w-full px-3.5 py-2 rounded-xl bg-slate-900 border border-slate-800 text-sm focus:border-teal-500 focus:outline-none transition"
                   />
                 </div>
               </div>
@@ -559,8 +753,37 @@ export default function Dashboard() {
           {/* Table Header & Tabs */}
           <div className="p-5 border-b border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
-              <h3 className="font-bold text-white text-base">Application History & Audit Log</h3>
-              <p className="text-xs text-slate-400">Stored persistently in MySQL database</p>
+              <div className="flex items-center gap-2">
+                <h3 className="font-bold text-white text-base">Application History & Audit Log</h3>
+                {/* Platform filter pills */}
+                <div className="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800 text-[10px]">
+                  <button
+                    onClick={() => setPlatformFilter('ALL')}
+                    className={`px-2 py-0.5 rounded font-medium transition ${platformFilter === 'ALL' ? 'bg-teal-500/30 text-teal-300 font-bold' : 'text-slate-400'}`}
+                  >
+                    All Boards
+                  </button>
+                  <button
+                    onClick={() => setPlatformFilter('NAUKRI')}
+                    className={`px-2 py-0.5 rounded font-medium transition ${platformFilter === 'NAUKRI' ? 'bg-cyan-500/30 text-cyan-300 font-bold' : 'text-slate-400'}`}
+                  >
+                    🔷 Naukri
+                  </button>
+                  <button
+                    onClick={() => setPlatformFilter('LINKEDIN')}
+                    className={`px-2 py-0.5 rounded font-medium transition ${platformFilter === 'LINKEDIN' ? 'bg-blue-500/30 text-blue-300 font-bold' : 'text-slate-400'}`}
+                  >
+                    🟦 LinkedIn
+                  </button>
+                  <button
+                    onClick={() => setPlatformFilter('NAUKRIGULF')}
+                    className={`px-2 py-0.5 rounded font-medium transition ${platformFilter === 'NAUKRIGULF' ? 'bg-emerald-500/30 text-emerald-300 font-bold' : 'text-slate-400'}`}
+                  >
+                    🌐 NaukriGulf
+                  </button>
+                </div>
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">Stored persistently in MySQL database across all 3 platforms (Naukri, LinkedIn, NaukriGulf)</p>
             </div>
 
             {/* Tabs */}
@@ -621,27 +844,55 @@ export default function Dashboard() {
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-900/60 text-slate-400 font-semibold border-b border-slate-800">
                 <tr>
+                  <th className="py-3 px-3 text-center w-12 text-slate-400">Sr No</th>
+                  <th className="py-3 px-4">Platform</th>
                   <th className="py-3 px-4">Job Title & Role</th>
                   <th className="py-3 px-4">Company</th>
                   <th className="py-3 px-4">Location</th>
                   <th className="py-3 px-4">AI Match</th>
-                  <th className="py-3 px-4">Status</th>
+                  <th className="py-3 px-4">Apply Type & Status</th>
                   <th className="py-3 px-4">Applied Date/Time</th>
                   <th className="py-3 px-4 text-right">Action / Link</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
                 {filteredApps.length > 0 ? (
-                  filteredApps.map((app) => (
+                  filteredApps.map((app, index) => (
                     <tr key={app.id} className="hover:bg-slate-800/30 transition">
+                      <td className="py-3 px-3 text-center text-slate-400 font-mono font-semibold text-xs">
+                        {index + 1}
+                      </td>
+                      <td className="py-3 px-4">
+                        {(app.platform || 'NAUKRI').toUpperCase() === 'LINKEDIN' ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-500/15 text-blue-400 border border-blue-500/30 inline-flex items-center gap-1">
+                            <span>🟦</span> LinkedIn
+                          </span>
+                        ) : (app.platform || '').toUpperCase() === 'NAUKRIGULF' ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 inline-flex items-center gap-1">
+                            <span>🌐</span> NaukriGulf
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 inline-flex items-center gap-1">
+                            <span>🔷</span> Naukri
+                          </span>
+                        )}
+                      </td>
                       <td className="py-3 px-4 font-medium text-white max-w-xs truncate">
                         {app.job_title}
                         {app.experience_req && (
                           <span className="block text-[10px] text-slate-400 font-normal">Exp: {app.experience_req}</span>
                         )}
                       </td>
-                      <td className="py-3 px-4 text-slate-300">{app.company_name}</td>
-                      <td className="py-3 px-4 text-slate-400">{app.location || 'Mumbai / Remote'}</td>
+                      <td className="py-3 px-4 text-slate-300 font-medium">{app.company_name}</td>
+                      <td className="py-3 px-4">
+                        <span className={`px-2 py-0.5 rounded-md text-[10px] font-medium ${
+                          (app.location || '').toLowerCase().includes('qatar') || (app.location || '').toLowerCase().includes('doha')
+                            ? 'bg-amber-500/10 text-amber-300 border border-amber-500/20'
+                            : 'bg-slate-800/80 text-slate-300'
+                        }`}>
+                          📍 {app.location || 'Mumbai / Remote'}
+                        </span>
+                      </td>
                       <td className="py-3 px-4">
                         <span className={`px-2 py-0.5 rounded-full text-[11px] font-semibold ${
                           (app.match_score || 85) >= 80 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
@@ -714,7 +965,7 @@ export default function Dashboard() {
                   ))
                 ) : (
                   <tr>
-                    <td colSpan="7" className="py-12 text-center text-slate-500">
+                    <td colSpan="9" className="py-12 text-center text-slate-500">
                       No applications recorded in this tab yet. Start the agent to apply!
                     </td>
                   </tr>

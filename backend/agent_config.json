@@ -16,7 +16,10 @@
     "block_payments": true,
     "block_sensitive_fields": true,
     "block_unverified_facts": true,
-    "max_daily_applications": 45
+    "max_daily_applications": 135,
+    "max_daily_naukri": 45,
+    "max_daily_linkedin": 45,
+    "max_daily_naukrigulf": 45
   },
   "cooldown": {
     "confirmed_min_sec": 120,

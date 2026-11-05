@@ -125,13 +125,29 @@ def evaluate_job_relevance(job_title: str, company: str, job_desc: str) -> Tuple
 def evaluate_job_match(job_title: str, company: str, job_desc: str) -> Tuple[int, bool, str]:
     """
     Evaluates how well a job posting matches Abdul Razzaque Shaikh's profile:
-    - 5+ years exp as Senior Full Stack Developer
-    - Skills: React.js, Next.js, Node.js, Express.js, TypeScript, JavaScript, MongoDB, PostgreSQL, MySQL
+    - 5+ years exp as Senior Full Stack Developer (MERN Stack)
+    - Primary Stack: React.js, Next.js, Node.js, Express.js, TypeScript, JavaScript, MongoDB, PostgreSQL, MySQL
     - Cloud/DevOps: Docker, Redis, Kafka, AWS, CI/CD, REST APIs, GraphQL
-    - Domains: Enterprise apps, E-commerce, CRM, POS, HRMS, Pharmacy ERP
+    - STRICT EXCLUSION: Java / Java Full Stack / Spring Boot / .NET / C# roles are strictly rejected!
     - Location: Mumbai / Pune / Remote (Based in Kurla, Mumbai)
     - Returns: (score: 0-100, should_apply: bool, reason: str)
     """
+    title_lower = (job_title or "").lower()
+    desc_lower = (job_desc or "").lower()
+
+    # 1. STRICT DISQUALIFIER: Java / Java Full Stack / Spring Boot
+    # Note: Must use word boundary \bjava\b so 'javascript' is NEVER blocked!
+    is_java_title = bool(re.search(r"\bjava\b", title_lower)) and not bool(re.search(r"\bjavascript\b", title_lower))
+    has_java_phrases = bool(re.search(r"\b(spring boot|springboot|j2ee|hibernate|core java|java developer|java full stack|full stack java|java backend|java engineer|java software)\b", title_lower))
+    if is_java_title or has_java_phrases:
+        return 0, False, "Blocked: Java / Spring Boot role (Candidate specializes strictly in MERN / JavaScript Full Stack, not Java)."
+
+    # 2. STRICT DISQUALIFIER: .NET / C# / PHP / Ruby
+    is_dotnet = any(k in title_lower for k in [".net", "dotnet", "c#", "asp.net"])
+    is_other_backend = bool(re.search(r"\b(php|laravel|wordpress|ruby|rails)\b", title_lower))
+    if is_dotnet or is_other_backend:
+        return 0, False, "Blocked: .NET / C# / PHP / Ruby role (Candidate is strictly MERN / JavaScript Full Stack)."
+
     target_terms = [
         "full stack", "fullstack", "mern", "react", "react.js", "reactjs",
         "node", "node.js", "nodejs", "next", "next.js", "nextjs",
@@ -139,28 +155,38 @@ def evaluate_job_match(job_title: str, company: str, job_desc: str) -> Tuple[int
         "software engineer", "software developer", "developer",
         "javascript", "typescript", "express"
     ]
-    title_lower = job_title.lower()
     
     matches_title = any(term in title_lower for term in target_terms)
     
     if not matches_title:
         return 40, False, "Job title does not match software/full-stack keywords"
 
+    # 3. Description-level check: Pure Java backend requirement with no MERN/Node
+    has_java_desc = bool(re.search(r"\b(core java|spring boot|j2ee|hibernate|java 8|java 11|java 17|java microservices)\b", desc_lower))
+    has_mern_desc = bool(re.search(r"\b(node|nodejs|node\.js|mern|react|reactjs|react\.js|javascript|typescript|next\.js|nextjs)\b", desc_lower))
+    if has_java_desc and not has_mern_desc:
+        return 20, False, "Blocked: Job description requires Java/Spring backend rather than MERN/JavaScript stack."
+
     prompt = f"""
 Candidate: Abdul Razzaque Shaikh, Senior Full Stack Developer (5+ years exp).
 Current Company: Tharb (Working Remotely from Kurla, Mumbai).
 Current CTC: 12 LPA | Expected CTC: 15 LPA | Notice Period: Immediate Joiner (0 days notice, not serving notice).
 Preferred Location: Mumbai / Pune / Remote.
-Primary Tech Stack: React.js, Next.js, JavaScript, TypeScript, Node.js, Express.js, MongoDB, PostgreSQL, MySQL.
+Primary Tech Stack: React.js, Next.js, JavaScript, TypeScript, Node.js, Express.js, MongoDB, PostgreSQL, MySQL (MERN Stack).
 Advanced Skills: REST APIs, GraphQL, Docker, Redis, Kafka, AWS, CI/CD, database optimization, performance tuning.
 Domain Experience: Enterprise applications, multi-vendor e-commerce platforms, CRM and POS systems, HRMS platforms, and pharmacy management ERP solutions.
-Target Roles: Senior Full Stack Developer, Full Stack Developer, MERN Stack Developer, React.js Developer, Node.js Developer, Next.js Developer.
+Target Roles: Senior Full Stack Developer, MERN Stack Developer, Full Stack Developer, React.js Developer, Node.js Developer, Next.js Developer.
+
+CRITICAL DISQUALIFIER:
+- The candidate specializes in JavaScript, TypeScript, Node.js, React.js, Next.js, and MongoDB (MERN Stack).
+- The candidate does NOT know Java well and does NOT apply to Java Full Stack or Spring Boot positions.
+- If this position requires Java, Core Java, Spring Boot, J2EE, Hibernate, .NET, or C# as a primary backend technology, rate score below 40 and set should_apply to false.
 
 Job Title: {job_title}
 Company: {company}
 Snippet/Description: {job_desc[:1200]}
 
-Evaluate if this job is a good fit for Abdul across MERN, Node.js, React.js, Next.js, or Full Stack positions. 
+Evaluate if this job is a good fit for Abdul across MERN, Node.js, React.js, Next.js, or Full Stack (JavaScript/TypeScript) positions. 
 Reply ONLY in valid JSON format with:
 {{"score": <integer 0-100>, "should_apply": <true/false>, "reason": "<1 short sentence>"}}
 """
@@ -178,6 +204,9 @@ Reply ONLY in valid JSON format with:
         reason = str(parsed.get("reason", "Strong alignment with React, Next.js, Node.js, TypeScript, and Full Stack stack."))
         return score, should_apply, reason
     except Exception:
+        # Final safety check before fallback: NEVER approve Java or .NET or non-MERN
+        if is_java_title or has_java_phrases or (has_java_desc and not has_mern_desc) or is_dotnet or is_other_backend:
+            return 0, False, "Blocked: Java / .NET / Non-MERN role (Candidate is strictly MERN / JavaScript Full Stack)."
         return 88, True, "Matches Senior Full Stack / MERN / React / Node / Next.js developer profile."
 
 def get_last_working_day(format_type: str = "text") -> str:
@@ -307,18 +336,49 @@ def evaluate_application_question(question: str, input_type: str = "text") -> Tu
         if any(k in q_low for k in ["comfortable", "willing", "relocate", "onsite", "hybrid", "remote", "authorized", "experience", "notice", "serving", "join", "available", "agree"]):
             return "Yes", False, "VERIFIED_PROFILE"
 
+    # Country Code, Country, State, City, Location, Address
+    q_clean = re.sub(r"[*?:_#()\-]+", " ", q_low).strip()
+    words = set(q_clean.split())
+
+    if any(k in q_clean for k in ["country code", "calling code", "dial code", "phone code"]):
+        return "+91", False, "VERIFIED_PROFILE"
+    if any(k in words for k in ["gender", "sex"]) and not any(k in q_clean for k in ["transgender"]):
+        return "Male", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["preferred pronoun", "pronoun"]):
+        return "He/Him", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["disability", "differently abled", "handicap", "pwd"]):
+        return "No", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["veteran", "armed forces", "indian army", "military"]):
+        return "No", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["previously worked", "worked with us", "worked for us", "ex-employee"]):
+        return "No", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["legally eligible", "eligible to work", "authorized to work", "work authorization", "right to work"]):
+        return "Yes", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["require visa sponsorship", "visa sponsorship", "sponsorship to continue", "require sponsorship"]):
+        return "No", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["working in mumbai", "currently working in mumbai", "mumbai location"]):
+        return "Yes", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["degree type"]):
+        return "BSC Computer Sciences", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["proven experience", "total experience 3 to 5", "3 to 5"]):
+        return "5" if is_num else "5+ years", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["relevant skills", "skills react"]):
+        return "Yes", False, "VERIFIED_PROFILE"
+    if any(k in q_clean for k in ["privacy policy", "privacy notice", "consent", "i confirm"]):
+        return "true", False, "VERIFIED_PROFILE"
+
     # City, State, Country, Postal Code, Address
-    if any(k == q_low or k in q_low.split() for k in ["city", "town", "current city"]):
+    if any(k in words for k in ["city", "town", "current city"]):
         return "Mumbai", False, "VERIFIED_PROFILE"
-    if (any(k == q_low or k in q_low.split() for k in ["state", "province", "region"]) or q_low == "state") and not any(v in q_low for v in ["statement", "state your"]):
+    if any(k in words for k in ["state", "province", "region"]) and not any(v in q_clean for v in ["statement", "state your", "united states"]):
         return "Maharashtra", False, "VERIFIED_PROFILE"
-    if any(k == q_low or k in q_low.split() for k in ["country", "nation"]):
+    if any(k in words for k in ["country", "nation", "citizenship", "nationality"]) and not any(k in q_clean for k in ["country code", "code"]):
         return "India", False, "VERIFIED_PROFILE"
-    if any(k in q_low for k in ["zip", "postal", "pincode", "pin code", "post code"]):
+    if any(k in q_clean for k in ["po box", "zip", "postal", "pincode", "pin code", "post code"]):
         return "400070", False, "VERIFIED_PROFILE"
-    if any(k in q_low for k in ["street", "address", "residential address"]):
+    if any(k in q_clean for k in ["street", "address", "residential address"]):
         return profile.get("current_location", "Kurla, Mumbai, Maharashtra"), False, "VERIFIED_PROFILE"
-    if any(k in q_low for k in ["your message", "cover letter", "message to hiring", "note"]):
+    if any(k in q_clean for k in ["your message", "cover letter", "message to hiring", "note"]):
         return "I am a Senior Full Stack Developer with 5+ years of experience in React.js, Next.js, Node.js, and MongoDB. Excited to bring scalable, high-performance web solutions to your engineering team.", False, "VERIFIED_PROFILE"
 
     # Current Location / Preferred Location

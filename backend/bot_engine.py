@@ -46,6 +46,8 @@ from question_answering import (
 from chat_panel_handler import naukri_chat_panel_handler, ChatPanelState
 from reasoning_engine import reasoning_engine, AutonomousReasoningEngine
 from button_service import button_service, is_naukri_application_confirmed
+from linkedin_engine import LinkedInEngine
+from naukrigulf_engine import NaukriGulfEngine
 
 class ApplicationStatus:
     JOB_FOUND = "JOB_FOUND"
@@ -86,7 +88,10 @@ class BotConfig:
         self.cooldown_max_sec = int(cooldown.get("confirmed_max_sec", 180))
         self.unconfirmed_cooldown_min_sec = int(cooldown.get("unconfirmed_min_sec", 45))
         self.unconfirmed_cooldown_max_sec = int(cooldown.get("unconfirmed_max_sec", 75))
-        self.daily_limit = int(safety.get("max_daily_applications", 45))
+        self.daily_limit = int(safety.get("max_daily_applications", 135))
+        self.naukri_quota = int(safety.get("max_daily_naukri", 45))
+        self.linkedin_quota = int(safety.get("max_daily_linkedin", 45))
+        self.naukrigulf_quota = int(safety.get("max_daily_naukrigulf", 45))
         self.max_retries = int(retry.get("max_retries", 2))
 
     def reload(self):
@@ -99,7 +104,10 @@ class BotConfig:
         self.cooldown_max_sec = int(cooldown.get("confirmed_max_sec", 180))
         self.unconfirmed_cooldown_min_sec = int(cooldown.get("unconfirmed_min_sec", 45))
         self.unconfirmed_cooldown_max_sec = int(cooldown.get("unconfirmed_max_sec", 75))
-        self.daily_limit = int(safety.get("max_daily_applications", 45))
+        self.daily_limit = int(safety.get("max_daily_applications", 135))
+        self.naukri_quota = int(safety.get("max_daily_naukri", 45))
+        self.linkedin_quota = int(safety.get("max_daily_linkedin", 45))
+        self.naukrigulf_quota = int(safety.get("max_daily_naukrigulf", 45))
         self.max_retries = int(retry.get("max_retries", 2))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -109,6 +117,9 @@ class BotConfig:
             "unconfirmed_cooldown_min_sec": self.unconfirmed_cooldown_min_sec,
             "unconfirmed_cooldown_max_sec": self.unconfirmed_cooldown_max_sec,
             "daily_limit": self.daily_limit,
+            "naukri_quota": self.naukri_quota,
+            "linkedin_quota": self.linkedin_quota,
+            "naukrigulf_quota": self.naukrigulf_quota,
             "max_retries": self.max_retries
         }
 
@@ -119,7 +130,17 @@ class BotState:
         self.current_job: Dict[str, Any] = {}
         self.countdown_remaining = 0
         self.today_applied = 0
-        self.daily_limit = 45
+        self.daily_limit = 135
+        self.platform_quotas = {
+            "NAUKRI": 45,
+            "LINKEDIN": 45,
+            "NAUKRIGULF": 45
+        }
+        self.platform_applied = {
+            "NAUKRI": 0,
+            "LINKEDIN": 0,
+            "NAUKRIGULF": 0
+        }
         self.last_error = ""
         self.stop_event = threading.Event()
         self.logs: List[Dict[str, str]] = []
@@ -151,6 +172,8 @@ class BotState:
             "countdown_remaining": self.countdown_remaining,
             "today_applied": self.today_applied,
             "daily_limit": self.daily_limit,
+            "platform_quotas": self.platform_quotas,
+            "platform_applied": self.platform_applied,
             "last_error": self.last_error,
             "recent_logs": self.logs[:15],
             "config": self.config.to_dict()
@@ -210,6 +233,14 @@ def cooldown_timer(min_sec: int = None, max_sec: int = None, stop_event: threadi
         time.sleep(1)
         
     bot_state.countdown_remaining = 0
+
+def safe_bring_to_front(pg):
+    """Safely brings a Playwright Page to front without raising exceptions if page is closed."""
+    try:
+        if pg and not pg.is_closed():
+            pg.bring_to_front()
+    except Exception:
+        pass
 
 def find_submit_button(page):
     """
@@ -504,7 +535,7 @@ def visual_human_type(target_page, element, text: str, stop_event: threading.Eve
         except Exception:
             pass
 
-def fill_company_form(target_page, stop_event: threading.Event, target_role: str = "", company_name: str = ""):
+def fill_company_form(target_page, stop_event: threading.Event, target_role: str = "", company_name: str = "", location_hint: str = ""):
     """
     Visually autofills comprehensive application fields on company portals like a real human:
     - Auto-attaches user's PDF resume file (Abdul_Razzaque_India.pdf) to file inputs
@@ -518,10 +549,14 @@ def fill_company_form(target_page, stop_event: threading.Event, target_role: str
     # Resolve resume path
     resume_path = profile.get("resume_path") or ""
     if not resume_path or not os.path.exists(resume_path):
+        is_gulf_target = any(k in (location_hint or "").lower() for k in ["qatar", "doha", "dubai", "uae", "emirates", "abu dhabi", "sharjah"])
+        target_res = "Abdul_Razzaque_Qatar.pdf" if is_gulf_target else "Abdul_Razzaque_India.pdf"
         candidate_paths = [
+            os.path.join(os.path.dirname(__file__), target_res),
             os.path.join(os.path.dirname(__file__), "Abdul_Razzaque_India.pdf"),
-            r"E:\Abdur Razzaque\Abdur Razzaque Both\Abdul Razzaque India.pdf",
-            os.path.join(os.path.dirname(__file__), "profile.pdf")
+            os.path.join(os.path.dirname(__file__), "Abdul_Razzaque_Qatar.pdf"),
+            r"E:\Abdur Razzaque\Abdur Razzaque Both\Abdul Razzaque Qatar.pdf",
+            r"E:\Abdur Razzaque\Abdur Razzaque Both\Abdul Razzaque India.pdf"
         ]
         for cp in candidate_paths:
             if os.path.exists(cp):
@@ -572,7 +607,8 @@ def fill_company_form(target_page, stop_event: threading.Event, target_role: str
         stop_event=stop_event,
         company_name=company_name,
         job_title=target_role,
-        logger_fn=bot_state.add_log
+        logger_fn=bot_state.add_log,
+        location_hint=location_hint
     )
 
     if form_res.get("status") == "NEEDS_USER_INPUT":
@@ -899,7 +935,7 @@ def handle_external_company_portal(context, detail_tab, company_tab, title: str,
 
         # Visually Fill Form on Company Site (Resume, Dropdowns, Radios, Checkboxes, Inputs, DOB)
         bot_state.add_log(f"✍️ Visually filling candidate information & resume on {company} portal...", "INFO")
-        fill_res = fill_company_form(company_tab, stop_event, target_role=title, company_name=company)
+        fill_res = fill_company_form(company_tab, stop_event, target_role=title, company_name=company, location_hint=loc_text)
         human_sleep(2, 3, stop_event)
 
         if isinstance(fill_res, dict) and fill_res.get("is_payment"):
@@ -916,7 +952,7 @@ def handle_external_company_portal(context, detail_tab, company_tab, title: str,
         if isinstance(fill_res, dict) and fill_res.get("needs_user_input"):
             reason = fill_res.get("reason", "NEEDS_USER_INPUT")
             bot_state.add_log(f"⚠️ [NEEDS_USER_INPUT] Mandatory question on {company} portal requires candidate input ({reason}). Tab kept OPEN in Chrome!", "WARNING")
-            company_tab.bring_to_front()
+            safe_bring_to_front(company_tab)
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=ext_url,
                 status=ApplicationStatus.NEEDS_USER_INPUT, apply_type='COMPANY_WEBSITE', match_score=score,
@@ -941,7 +977,7 @@ def handle_external_company_portal(context, detail_tab, company_tab, title: str,
 
         if has_captcha or has_password:
             bot_state.add_log(f"🤖 CAPTCHA challenge or Account Login detected on {company} portal. Leaving tab OPEN in Chrome for you!", "WARNING")
-            company_tab.bring_to_front()
+            safe_bring_to_front(company_tab)
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=ext_url,
                 status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
@@ -960,7 +996,7 @@ def handle_external_company_portal(context, detail_tab, company_tab, title: str,
         # Check authorization: is auto_submit_company_portal allowed?
         if not agent_config_manager.is_authorized("auto_submit_company_portal"):
             bot_state.add_log(f"Form filled on {company} portal. Auto-submit on company portal is disabled by config. Tab kept OPEN for review.", "INFO")
-            company_tab.bring_to_front()
+            safe_bring_to_front(company_tab)
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=ext_url,
                 status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
@@ -1020,7 +1056,7 @@ def handle_external_company_portal(context, detail_tab, company_tab, title: str,
                 return {"status": ApplicationStatus.APPLICATION_CONFIRMED, "success": True, "failure_reason": "", "attempted": True}
             else:
                 bot_state.add_log(f"⚠️ Form filled for {company}. Tab kept OPEN in Chrome for your review!", "WARNING")
-                company_tab.bring_to_front()
+                safe_bring_to_front(company_tab)
                 record_application(
                     job_title=title, company_name=company, location=loc_text, job_url=ext_url,
                     status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
@@ -1037,7 +1073,7 @@ def handle_external_company_portal(context, detail_tab, company_tab, title: str,
                 return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "success": False, "failure_reason": "CONFIRMATION_UNCERTAIN", "attempted": True}
         else:
             bot_state.add_log(f"Form filled on {company} portal. Tab kept OPEN in Chrome for final submission.", "WARNING")
-            company_tab.bring_to_front()
+            safe_bring_to_front(company_tab)
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=ext_url,
                 status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
@@ -1090,7 +1126,7 @@ def process_job_application(context, search_page, title: str, company: str, loc_
         bot_state.current_job["stage"] = ApplicationStatus.JOB_DETAILS_OPENED
         bot_state.add_log(f"📄 Opening job details tab for {title} @ {company}...", "INFO")
         detail_tab = context.new_page()
-        detail_tab.bring_to_front()
+        safe_bring_to_front(detail_tab)
 
         # Handle dialog popups automatically so browser never hangs
         try:
@@ -1130,14 +1166,15 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                 detail_tab.close()
             return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "STOP_REQUESTED", "attempted": False}
 
-        # If landed on Gulf, abort
-        if "naukrigulf" in detail_tab.url.lower():
-            bot_state.add_log(f"Gulf URL detected on {company}. Enforcing India only. Closing tab.", "WARNING")
+        # If landed on Gulf, abort only if NOT targeting Qatar/Gulf
+        is_qatar_dest = any(k in f"{loc_text} {title} {company}".lower() for k in ["qatar", "doha", "gcc"])
+        if "naukrigulf" in detail_tab.url.lower() and not is_qatar_dest:
+            bot_state.add_log(f"Gulf URL detected on {company}. Non-Qatar target. Closing tab.", "WARNING")
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
                 status=ApplicationStatus.APPLICATION_SKIPPED, apply_type='DIRECT_NAUKRI', match_score=score,
                 notes="Excluded: NaukriGulf regional posting.", failure_reason="GULF_REGION_EXCLUDED",
-                experience_req=exp_text
+                experience_req=exp_text, platform="NAUKRI"
             )
             detail_tab.close()
             return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "GULF_REGION_EXCLUDED", "attempted": False}
@@ -1189,7 +1226,7 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                     company_tab = detail_tab
 
             human_sleep(3, 5, stop_event)
-            company_tab.bring_to_front()
+            safe_bring_to_front(company_tab)
 
             try:
                 company_tab.wait_for_load_state("domcontentloaded", timeout=20000)
@@ -1241,7 +1278,7 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                 elif "naukri.com" not in new_tab_opened.url.lower():
                     bot_state.add_log(f"🌐 Clicking Apply opened external portal in new tab for {company}!", "INFO")
                     company_tab = new_tab_opened
-                    company_tab.bring_to_front()
+                    safe_bring_to_front(company_tab)
                     try:
                         company_tab.wait_for_load_state("domcontentloaded", timeout=15000)
                     except Exception:
@@ -1298,7 +1335,7 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                         reason = drawer_res.get("reason", "NEEDS_USER_INPUT")
                         unanswered = drawer_res.get("unanswered_question", "")
                         bot_state.add_log(f"⚠️ [NEEDS_USER_INPUT] Screening questionnaire for {company} needs candidate input: '{unanswered[:30]}' ({reason}). Tab kept OPEN in Chrome!", "WARNING")
-                        detail_tab.bring_to_front()
+                        safe_bring_to_front(detail_tab)
                         record_application(
                             job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
                             status=ApplicationStatus.NEEDS_USER_INPUT, apply_type='DIRECT_NAUKRI', match_score=score,
@@ -1317,7 +1354,7 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                             reason = drawer_res.get("failure_reason", "CONFIRMATION_TIMEOUT")
                             unanswered = drawer_res.get("unanswered_question", "")
                             bot_state.add_log(f"⚠️ Application questionnaire remained open or timed out for {company} (Question: '{unanswered[:30]}'). Tab kept OPEN in Chrome!", "WARNING")
-                            detail_tab.bring_to_front()
+                            safe_bring_to_front(detail_tab)
                             record_application(
                                 job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
                                 status=ApplicationStatus.APPLICATION_FAILED, apply_type='DIRECT_NAUKRI', match_score=score,
@@ -1330,7 +1367,7 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                     elif drawer_res.get("status") == ApplicationStatus.APPLICATION_PENDING_CONFIRMATION:
                         reason = drawer_res.get("reason", "AUTO_SUBMIT_DIRECT_NOT_AUTHORIZED")
                         bot_state.add_log(f"Screening completed for {company}. Auto-submit not authorized. Tab kept OPEN for review.", "INFO")
-                        detail_tab.bring_to_front()
+                        safe_bring_to_front(detail_tab)
                         record_application(
                             job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
                             status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='DIRECT_NAUKRI', match_score=score,
@@ -1469,7 +1506,7 @@ def process_job_application(context, search_page, title: str, company: str, loc_
 
                 if has_open_form:
                     bot_state.add_log(f"Form or questions still open on tab for {company}. Keeping tab OPEN in Chrome for review.", "WARNING")
-                    detail_tab.bring_to_front()
+                    safe_bring_to_front(detail_tab)
                 else:
                     try:
                         detail_tab.close()
@@ -1512,13 +1549,54 @@ def process_job_application(context, search_page, title: str, company: str, loc_
         cooldown_timer(min_sec=bot_state.config.unconfirmed_cooldown_min_sec, max_sec=bot_state.config.unconfirmed_cooldown_max_sec, stop_event=stop_event, reason=f"Safety pause after error on {company}")
         return {"status": ApplicationStatus.APPLICATION_FAILED, "success": False, "failure_reason": str(e), "attempted": True}
 
+linkedin_engine = LinkedInEngine(
+    bot_state=bot_state,
+    cooldown_timer_fn=cooldown_timer,
+    human_sleep_fn=human_sleep,
+    external_portal_fn=handle_external_company_portal
+)
+
+naukrigulf_engine = NaukriGulfEngine(
+    bot_state=bot_state,
+    cooldown_timer_fn=cooldown_timer,
+    human_sleep_fn=human_sleep,
+    external_portal_fn=handle_external_company_portal
+)
+
 DEFAULT_TARGET_ROLES = [
+    {"name": "Senior Full Stack Developer", "slug": "senior-full-stack-developer"},
     {"name": "MERN Stack Developer", "slug": "mern-stack-developer"},
+    {"name": "Senior Software Engineer", "slug": "senior-software-engineer"},
+    {"name": "Full Stack Developer", "slug": "full-stack-developer"},
     {"name": "Node.js Developer", "slug": "node-js-developer"},
     {"name": "React Developer", "slug": "react-developer"},
-    {"name": "Next.js Developer", "slug": "next-js-developer"},
-    {"name": "Full Stack Developer", "slug": "full-stack-developer"}
+    {"name": "Next.js Developer", "slug": "next-js-developer"}
 ]
+
+def is_job_title_blacklisted(title: str) -> Tuple[bool, str]:
+    """
+    STRICT CANDIDATE RULE:
+    Reject Java / Java Full Stack / Spring Boot / .NET / C# / PHP roles.
+    Candidate specializes strictly in MERN Stack (React, Node, Express, MongoDB, JavaScript, TypeScript).
+    Note: Must use regex word boundary \bjava\b so 'javascript' is NEVER blocked!
+    """
+    if not title:
+        return False, ""
+    t_low = title.lower().strip()
+
+    # Distinguish 'java' from 'javascript' using word boundary
+    is_java = bool(re.search(r"\bjava\b", t_low)) and not bool(re.search(r"\bjavascript\b", t_low))
+    has_java_phrases = bool(re.search(r"\b(spring boot|springboot|j2ee|hibernate|core java|java developer|java full stack|full stack java|java backend|java engineer|java software)\b", t_low))
+    if is_java or has_java_phrases:
+        return True, "Java / Spring Boot role (Candidate is strictly MERN / JavaScript Full Stack, not Java)"
+
+    if any(k in t_low for k in [".net", "dotnet", "c#", "asp.net"]):
+        return True, ".NET / C# role (Candidate is strictly MERN / JavaScript Full Stack)"
+
+    if bool(re.search(r"\b(php|laravel|wordpress|ruby|rails)\b", t_low)):
+        return True, "Non-MERN backend role (Candidate is strictly MERN / JavaScript Full Stack)"
+
+    return False, ""
 
 def format_naukri_slug(keyword: str) -> str:
     cleaned = keyword.lower().replace(".", "-").replace("/", "-")
@@ -1545,7 +1623,63 @@ def parse_target_roles(search_input: str) -> List[Dict[str, str]]:
     # Custom single role
     return [{"name": raw, "slug": format_naukri_slug(raw)}]
 
-def run_naukri_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)", location: str = "Mumbai", experience_years: int = 5):
+def parse_target_locations(location_input: str, default_locs: List[str] = None) -> List[str]:
+    defaults = default_locs or ["Mumbai", "Pune", "Remote"]
+    raw = (location_input or "").strip()
+    if not raw:
+        return defaults
+    clean = raw.replace(" and ", ",").replace("&", ",").replace("+", ",")
+    locs = [l.strip() for l in clean.split(",") if l.strip()]
+    return locs if locs else defaults
+
+def is_naukri_location_valid(loc_text: str, allowed_locations: List[str] = None) -> bool:
+    """
+    STRICT CANDIDATE RULE: Restrict Naukri.com applications strictly to Mumbai, Pune, and Remote.
+    Jobs located in Noida, Gurugram, Gurgaon, Kolkata, Delhi/NCR, Bengaluru, Hyderabad, etc.
+    MUST be strictly filtered out and never applied to or queued.
+    """
+    if not loc_text:
+        return True
+    
+    lt = loc_text.lower().strip()
+    
+    # Allowed locations & sub-localities
+    valid_terms = [
+        "mumbai", "navi mumbai", "thane", "kurla", "andheri", "bkc",
+        "pune", "hinjewadi", "hinjawadi", "magarpatta", "kharadi", "baner", "wakad", "yerwada",
+        "remote", "wfh", "work from home", "anywhere in india", "pan india"
+    ]
+    has_valid_term = any(v in lt for v in valid_terms)
+    
+    # Explicitly non-permitted locations
+    disallowed_terms = [
+        "noida", "gurugram", "gurgaon", "delhi", "ncr", "kolkata", "bengaluru", "bangalore",
+        "hyderabad", "secunderabad", "chennai", "ahmedabad", "jaipur", "chandigarh", "lucknow", "indore"
+    ]
+    
+    if not has_valid_term:
+        return False
+        
+    has_disallowed = any(d in lt for d in disallowed_terms)
+    is_pure_remote = any(r in lt for r in ["remote", "wfh", "work from home"])
+    is_mumbai_pune = any(m in lt for m in ["mumbai", "navi mumbai", "thane", "pune", "hinjewadi", "hinjawadi"])
+    
+    # If explicitly mentions Noida, Gurugram, Delhi/NCR, or Kolkata, strictly block unless 100% remote
+    if any(d in lt for d in ["noida", "gurugram", "gurgaon", "delhi", "ncr", "kolkata"]) and not is_pure_remote:
+        return False
+
+    if has_disallowed and not is_pure_remote and not is_mumbai_pune:
+        return False
+        
+    return True
+
+def run_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)", 
+                   location: str = "Mumbai, Pune, Qatar, Remote", 
+                   experience_years: int = 5, 
+                   platform: str = "ALL",
+                   naukri_locations: str = "Mumbai, Pune, Remote",
+                   linkedin_locations: str = "Mumbai, Pune, Qatar, Remote",
+                   naukrigulf_locations: str = "Qatar, Dubai, UAE, Saudi Arabia, Remote"):
     """Main worker thread running the Playwright Chrome CDP automation."""
     bot_state.is_running = True
     bot_state.stop_event.clear()
@@ -1553,20 +1687,25 @@ def run_naukri_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)",
     
     try:
         bot_state.config.reload()
-        max_daily = int(agent_config_manager.get_config().get("safety_boundaries", {}).get("max_daily_applications", 45))
-        bot_state.daily_limit = max_daily
-        bot_state.today_applied = get_today_applied_count()
-        bot_state.add_log(f"Starting Naukri Agent in Autonomous Mode. Today's applied count: {bot_state.today_applied}/{bot_state.daily_limit}", "INFO")
+        naukri_quota = 45
+        linkedin_quota = 45
+        naukrigulf_quota = 45
+        bot_state.platform_quotas = {"NAUKRI": naukri_quota, "LINKEDIN": linkedin_quota, "NAUKRIGULF": naukrigulf_quota}
+        bot_state.platform_applied = {
+            "NAUKRI": get_today_applied_count("NAUKRI"),
+            "LINKEDIN": get_today_applied_count("LINKEDIN"),
+            "NAUKRIGULF": get_today_applied_count("NAUKRIGULF")
+        }
+        bot_state.today_applied = sum(bot_state.platform_applied.values())
+        bot_state.daily_limit = 135
+
+        platform_up = (platform or "ALL").upper()
+        bot_state.add_log(f"Starting Job Copilot in Autonomous Mode. Platform: {platform_up}.", "INFO")
+        bot_state.add_log(f"📊 Separate Daily Quotas: Naukri.com ({bot_state.platform_applied['NAUKRI']}/{naukri_quota}) | LinkedIn ({bot_state.platform_applied['LINKEDIN']}/{linkedin_quota}) | NaukriGulf ({bot_state.platform_applied['NAUKRIGULF']}/{naukrigulf_quota})", "INFO")
 
         if not agent_config_manager.is_authorized("auto_search"):
             bot_state.status = "IDLE"
             bot_state.add_log("auto_search is disabled in agent config permissions. Halting search.", "WARNING")
-            bot_state.is_running = False
-            return
-
-        if bot_state.today_applied >= bot_state.daily_limit:
-            bot_state.status = "LIMIT_REACHED"
-            bot_state.add_log(f"Daily safe limit of {bot_state.daily_limit} already reached for today. Stopping for safety.", "WARNING")
             bot_state.is_running = False
             return
 
@@ -1589,209 +1728,306 @@ def run_naukri_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)",
                     except Exception:
                         return ctx.new_page()
 
-                # Use active page or open new
-                page: Page = get_safe_page(context)
                 bot_state.add_log("Successfully connected to existing Chrome session!", "SUCCESS")
 
-                # Enforce Naukri.com India and block NaukriGulf completely
-                try:
-                    page.route("**/*naukrigulf.com*", lambda route: route.abort())
-                    context.add_cookies([
-                        {"name": "naukri_geo", "value": "IN", "domain": ".naukri.com", "path": "/"},
-                        {"name": "n_country", "value": "IN", "domain": ".naukri.com", "path": "/"}
-                    ])
-                except Exception as route_err:
-                    pass
+                # --- 1. NAUKRI SEARCH CYCLE ---
+                if platform_up in ("ALL", "NAUKRI") and not bot_state.stop_event.is_set():
+                    naukri_today = get_today_applied_count("NAUKRI")
+                    if naukri_today < naukri_quota:
+                        page: Page = get_safe_page(context)
+                        bot_state.add_log(f"🔷 [Naukri Engine] Starting Naukri.com search cycle (Today: {naukri_today}/{naukri_quota})...", "INFO")
 
-                loc_formatted = location.strip().lower().replace(" ", "-").replace("/", "-")
-
-                for role_idx, current_role in enumerate(target_roles):
-                    if bot_state.stop_event.is_set():
-                        bot_state.add_log("Stop requested by user. Pausing agent.", "WARNING")
-                        break
-
-                    bot_state.today_applied = get_today_applied_count()
-                    if bot_state.today_applied >= bot_state.daily_limit:
-                        bot_state.status = "LIMIT_REACHED"
-                        bot_state.add_log(f"Target daily quota of {bot_state.daily_limit} reached! Halting agent.", "SUCCESS")
-                        break
-
-                    role_name = current_role["name"]
-                    role_slug = current_role["slug"]
-
-                    if not loc_formatted or "remote" in loc_formatted:
-                        target_url = f"https://www.naukri.com/{role_slug}-jobs?experience={experience_years}"
-                    else:
-                        target_url = f"https://www.naukri.com/{role_slug}-jobs-in-{loc_formatted}?experience={experience_years}"
-
-                    bot_state.status = "SEARCHING"
-                    bot_state.add_log(f"🔎 [{role_idx+1}/{len(target_roles)}] Searching Naukri India for '{role_name}': {target_url}", "INFO")
-
-                    try:
-                        if not page or page.is_closed():
-                            page = get_safe_page(context)
-                        page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                        human_sleep(4, 7, bot_state.stop_event)
-                    except Exception as nav_e:
-                        bot_state.add_log(f"Navigation warning for '{role_name}': {nav_e}", "WARNING")
-                        continue
-
-                    # Extra check: if page still landed on naukrigulf, force back
-                    if "naukrigulf" in page.url.lower():
-                        bot_state.add_log("Detected NaukriGulf redirect attempt. Re-forcing Naukri India...", "WARNING")
-                        page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                        human_sleep(3, 5, bot_state.stop_event)
-
-                    # Wait for job container
-                    try:
-                        page.wait_for_selector(".styles_job-listing-container__wfdNl, .cust-job-tuple, .srp-jobtuple-wrapper", timeout=12000)
-                    except Exception:
-                        bot_state.add_log(f"No job cards container detected for '{role_name}'. Moving to next role...", "WARNING")
-                        continue
-
-                    # Scroll down naturally to simulate reading
-                    bot_state.add_log(f"Scrolling through '{role_name}' results like a human user...", "INFO")
-                    for _ in range(3):
-                        if bot_state.stop_event.is_set():
-                            break
                         try:
-                            if page and not page.is_closed():
-                                page.mouse.wheel(0, random.randint(300, 600))
-                        except Exception:
-                            pass
-                        human_sleep(1.2, 2.5, bot_state.stop_event)
-
-                    # Locate job cards safely
-                    if not page or page.is_closed():
-                        page = get_safe_page(context)
-                    job_cards = page.query_selector_all(".cust-job-tuple, .srp-jobtuple-wrapper, article.jobTuple")
-                    bot_state.add_log(f"Found {len(job_cards)} job cards on current page for '{role_name}'. Parsing...", "INFO")
-
-                    jobs_to_process = []
-                    for card in job_cards:
-                        try:
-                            title_elem = card.query_selector(".title, a.title, .job-title")
-                            company_elem = card.query_selector(".comp-name, a.subTitle, .comp-name-link")
-                            loc_elem = card.query_selector(".locWdth, .location, span.loc")
-                            exp_elem = card.query_selector(".expwdth, .experience, span.exp")
-                        
-                            t = title_elem.inner_text().strip() if title_elem else ""
-                            c = company_elem.inner_text().strip() if company_elem else ""
-                            l = loc_elem.inner_text().strip() if loc_elem else location
-                            e = exp_elem.inner_text().strip() if exp_elem else f"{experience_years} Yrs"
-                            u = title_elem.get_attribute("href") if title_elem else ""
-                        
-                            if t and c and u:
-                                jobs_to_process.append({
-                                    "title": t,
-                                    "company": c,
-                                    "location": l,
-                                    "experience": e,
-                                    "url": u
-                                })
+                            context.add_cookies([
+                                {"name": "naukri_geo", "value": "IN", "domain": ".naukri.com", "path": "/"},
+                                {"name": "n_country", "value": "IN", "domain": ".naukri.com", "path": "/"}
+                            ])
                         except Exception:
                             pass
 
-                    if not jobs_to_process:
-                        bot_state.add_log(f"No job cards found for '{role_name}'. Proceeding to next role...", "INFO")
-                        continue
+                        # Naukri.com: strictly Mumbai, Pune, and Remote (India)
+                        raw_naukri_list = parse_target_locations(naukri_locations or "Mumbai, Pune, Remote", default_locs=["Mumbai", "Pune", "Remote"])
+                        naukri_locs_list = []
+                        for loc_item in raw_naukri_list:
+                            l_low = loc_item.lower().strip()
+                            if any(v in l_low for v in ["mumbai", "pune", "remote", "wfh", "navi mumbai", "thane"]):
+                                if not any(d in l_low for d in ["noida", "gurugram", "gurgaon", "delhi", "ncr", "kolkata", "bengaluru", "bangalore", "hyderabad", "chennai", "qatar", "dubai"]):
+                                    naukri_locs_list.append(loc_item)
+                        if not naukri_locs_list:
+                            naukri_locs_list = ["Mumbai", "Pune", "Remote"]
 
-                    bot_state.add_log(f"Queued {len(jobs_to_process)} jobs to inspect for '{role_name}'.", "INFO")
+                        bot_state.add_log(f"🔷 [Naukri Engine] Target Locations ({len(naukri_locs_list)}): {', '.join(naukri_locs_list)}", "INFO")
 
-                    for index, job in enumerate(jobs_to_process):
-                        if bot_state.stop_event.is_set():
-                            bot_state.add_log("Stop requested by user. Pausing agent.", "WARNING")
-                            break
+                        for current_loc_str in naukri_locs_list:
+                            if bot_state.stop_event.is_set():
+                                break
 
-                        # Check daily safe limit
-                        bot_state.today_applied = get_today_applied_count()
-                        if bot_state.today_applied >= bot_state.daily_limit:
-                            bot_state.status = "LIMIT_REACHED"
-                            bot_state.add_log(f"Target daily quota of {bot_state.daily_limit} reached! Halting agent.", "SUCCESS")
-                            break
+                            naukri_today = get_today_applied_count("NAUKRI")
+                            if naukri_today >= naukri_quota:
+                                bot_state.add_log(f"🏆 Target daily quota for Naukri.com ({naukri_quota}) reached! Moving to next platform...", "SUCCESS")
+                                break
 
-                        title = job["title"]
-                        company = job["company"]
-                        loc_text = job["location"]
-                        exp_text = job["experience"]
-                        job_url = job["url"]
+                            loc_lower = current_loc_str.strip().lower()
+                            is_remote = "remote" in loc_lower or "wfh" in loc_lower
+                            loc_formatted = loc_lower.replace(" ", "-").replace("/", "-")
 
-                        bot_state.current_job = {
-                            "title": title,
-                            "company": company,
-                            "location": loc_text,
-                            "experience": exp_text,
-                            "url": job_url,
-                            "role_category": role_name
-                        }
+                            for role_idx, current_role in enumerate(target_roles):
+                                if bot_state.stop_event.is_set():
+                                    bot_state.add_log("Stop requested by user. Pausing agent.", "WARNING")
+                                    break
 
-                        bot_state.add_log(f"Inspecting [{index+1}/{len(jobs_to_process)}] ({role_name}): {title} @ {company}", "INFO")
+                                naukri_today = get_today_applied_count("NAUKRI")
+                                bot_state.platform_applied["NAUKRI"] = naukri_today
+                                bot_state.today_applied = sum(bot_state.platform_applied.values())
+                                if naukri_today >= naukri_quota:
+                                    bot_state.add_log(f"🏆 Target daily quota for Naukri.com ({naukri_quota}) reached! Moving to next platform...", "SUCCESS")
+                                    break
 
-                        # Strictly ignore any NaukriGulf posting
-                        if "naukrigulf" in (job_url or "").lower():
-                            bot_state.add_log(f"Skipping Gulf posting for {company}. Enforcing Naukri India only.", "WARNING")
-                            continue
+                                role_name = current_role["name"]
+                                role_slug = current_role["slug"]
 
-                        # Check duplicate in DB
-                        if check_already_applied_db(title, company):
-                            bot_state.add_log(f"Already applied to {title} @ {company} in the past. Skipping.", "INFO")
-                            continue
+                                if is_remote:
+                                    target_url = f"https://www.naukri.com/{role_slug}-jobs?wfhType=0&experience={experience_years}"
+                                else:
+                                    target_url = f"https://www.naukri.com/{role_slug}-jobs-in-{loc_formatted}?experience={experience_years}"
 
-                        # Check AI relevance
-                        bot_state.status = "EVALUATING"
-                        score, should_apply, reason = evaluate_job_relevance(title, company, f"Location: {loc_text}, Experience: {exp_text}")
-                        bot_state.add_log(f"AI Match Score: {score}% - {reason}", "INFO" if should_apply else "WARNING")
+                                bot_state.status = "SEARCHING"
+                                bot_state.add_log(f"🔎 [Naukri] [{role_idx+1}/{len(target_roles)}] Searching for '{role_name}' in {current_loc_str}: {target_url}", "INFO")
 
-                        if not should_apply or score < 65:
-                            bot_state.add_log(f"Job does not match profile criteria. Skipping.", "INFO")
-                            record_application(
-                                job_title=title,
-                                company_name=company,
-                                location=loc_text,
+                                try:
+                                    if not page or page.is_closed():
+                                        page = get_safe_page(context)
+                                    page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                                    human_sleep(4, 7, bot_state.stop_event)
+                                except Exception as nav_e:
+                                    bot_state.add_log(f"Navigation warning for '{role_name}': {nav_e}", "WARNING")
+                                    continue
+
+                                # Extra check: if page landed on naukrigulf during Naukri India search, re-force
+                                if "naukrigulf" in page.url.lower():
+                                    bot_state.add_log("Detected NaukriGulf redirect during Naukri India search. Re-forcing...", "WARNING")
+                                    page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                                    human_sleep(3, 5, bot_state.stop_event)
+
+                                # Wait for job container
+                                try:
+                                    page.wait_for_selector(".styles_job-listing-container__wfdNl, .cust-job-tuple, .srp-jobtuple-wrapper", timeout=12000)
+                                except Exception:
+                                    bot_state.add_log(f"No job cards container detected for '{role_name}'. Moving to next role...", "WARNING")
+                                    continue
+
+                                # Scroll down naturally to simulate reading
+                                bot_state.add_log(f"Scrolling through '{role_name}' results like a human user...", "INFO")
+                                for _ in range(3):
+                                    if bot_state.stop_event.is_set():
+                                        break
+                                    try:
+                                        if page and not page.is_closed():
+                                            page.mouse.wheel(0, random.randint(300, 600))
+                                    except Exception:
+                                        pass
+                                    human_sleep(1.2, 2.5, bot_state.stop_event)
+
+                                # Locate job cards safely
+                                if not page or page.is_closed():
+                                    page = get_safe_page(context)
+                                job_cards = page.query_selector_all(".cust-job-tuple, .srp-jobtuple-wrapper, article.jobTuple")
+                                bot_state.add_log(f"Found {len(job_cards)} job cards on current page for '{role_name}'. Parsing...", "INFO")
+
+                                jobs_to_process = []
+                                for card in job_cards:
+                                    try:
+                                        title_elem = card.query_selector(".title, a.title, .job-title")
+                                        company_elem = card.query_selector(".comp-name, a.subTitle, .comp-name-link")
+                                        loc_elem = card.query_selector(".locWdth, .location, span.loc")
+                                        exp_elem = card.query_selector(".expwdth, .experience, span.exp")
+                                    
+                                        t = title_elem.inner_text().strip() if title_elem else ""
+                                        c = company_elem.inner_text().strip() if company_elem else ""
+                                        l = loc_elem.inner_text().strip() if loc_elem else location
+                                        e = exp_elem.inner_text().strip() if exp_elem else f"{experience_years} Yrs"
+                                        u = title_elem.get_attribute("href") if title_elem else ""
+                                    
+                                        if t and c and u:
+                                            jobs_to_process.append({
+                                                "title": t,
+                                                "company": c,
+                                                "location": l,
+                                                "experience": e,
+                                                "url": u
+                                            })
+                                    except Exception:
+                                        pass
+
+                                if not jobs_to_process:
+                                    bot_state.add_log(f"No job cards found for '{role_name}'. Proceeding to next role...", "INFO")
+                                    continue
+
+                                bot_state.add_log(f"Queued {len(jobs_to_process)} jobs to inspect for '{role_name}'.", "INFO")
+
+                                for index, job in enumerate(jobs_to_process):
+                                    if bot_state.stop_event.is_set():
+                                        bot_state.add_log("Stop requested by user. Pausing agent.", "WARNING")
+                                        break
+
+                                    naukri_today = get_today_applied_count("NAUKRI")
+                                    bot_state.platform_applied["NAUKRI"] = naukri_today
+                                    bot_state.today_applied = sum(bot_state.platform_applied.values())
+                                    if naukri_today >= naukri_quota:
+                                        bot_state.add_log(f"🏆 Target daily quota for Naukri.com ({naukri_quota}) reached! Moving to next platform...", "SUCCESS")
+                                        break
+
+                                    title = job["title"]
+                                    company = job["company"]
+                                    loc_text = job["location"]
+                                    exp_text = job["experience"]
+                                    job_url = job["url"]
+
+                                    bot_state.current_job = {
+                                        "title": title,
+                                        "company": company,
+                                        "location": loc_text,
+                                        "experience": exp_text,
+                                        "url": job_url,
+                                        "role_category": role_name
+                                    }
+
+                                    bot_state.add_log(f"Inspecting [{index+1}/{len(jobs_to_process)}] ({role_name}): {title} @ {company}", "INFO")
+
+                                    # Ignore Gulf postings during Naukri India search (NaukriGulf engine handles them!)
+                                    if "naukrigulf" in (job_url or "").lower():
+                                        bot_state.add_log(f"Skipping Gulf posting for {company} on Naukri India. NaukriGulf engine will process Gulf jobs separately.", "INFO")
+                                        continue
+
+                            # STRICT NAUKRI LOCATION FILTER: Only Mumbai, Pune, Remote allowed!
+                            # Blocks Noida, Gurugram, Kolkata, Delhi, Bengaluru, Hyderabad, etc.
+                            if not is_naukri_location_valid(loc_text, naukri_locs_list):
+                                bot_state.add_log(f"📍 Location '{loc_text}' is not allowed for Naukri.com (Allowed: Mumbai, Pune, Remote). Skipping.", "WARNING")
+                                record_application(
+                                    job_title=title,
+                                    company_name=company,
+                                    location=loc_text,
+                                    job_url=job_url,
+                                    status=ApplicationStatus.APPLICATION_SKIPPED,
+                                    match_score=0,
+                                    notes=f"Skipped: Location '{loc_text}' outside candidate target regions (Mumbai, Pune, Remote).",
+                                    failure_reason="LOCATION_NOT_ALLOWED",
+                                    platform="NAUKRI"
+                                )
+                                continue
+
+                            # Check blacklisted technology titles (e.g. Java Full Stack, Spring Boot, .NET)
+                            is_title_blocked, title_block_reason = is_job_title_blacklisted(title)
+                            if is_title_blocked:
+                                bot_state.add_log(f"🚫 Skipping unwanted tech role '{title}' @ {company}: {title_block_reason}", "INFO")
+                                record_application(
+                                    job_title=title,
+                                    company_name=company,
+                                    location=loc_text,
+                                    job_url=job_url,
+                                    status=ApplicationStatus.APPLICATION_SKIPPED,
+                                    match_score=0,
+                                    notes=f"Skipped: {title_block_reason}",
+                                    failure_reason="TECHNOLOGY_NOT_ALLOWED",
+                                    platform="NAUKRI"
+                                )
+                                continue
+
+                            # Check duplicate in DB
+                            if check_already_applied_db(title, company):
+                                bot_state.add_log(f"Already applied to {title} @ {company} in the past. Skipping.", "INFO")
+                                continue
+
+                            # Check AI relevance
+                            bot_state.status = "EVALUATING"
+                            score, should_apply, reason = evaluate_job_relevance(title, company, f"Location: {loc_text}, Experience: {exp_text}")
+                            bot_state.add_log(f"AI Match Score: {score}% - {reason}", "INFO" if should_apply else "WARNING")
+
+                            if not should_apply or score < 65:
+                                bot_state.add_log(f"Job does not match profile criteria. Skipping.", "INFO")
+                                record_application(
+                                    job_title=title,
+                                    company_name=company,
+                                    location=loc_text,
+                                    job_url=job_url,
+                                    status=ApplicationStatus.APPLICATION_SKIPPED,
+                                    match_score=score,
+                                    notes=f"AI Skipped: {reason}",
+                                    failure_reason="LOW_MATCH_SCORE",
+                                    experience_req=exp_text
+                                )
+                                continue
+
+                            # Ensure search page is alive
+                            if page is None or page.is_closed():
+                                try:
+                                    page = context.new_page()
+                                except Exception:
+                                    pass
+
+                            # Execute Unified Application Engine (Direct Naukri vs Company Portal)
+                            process_job_application(
+                                context=context,
+                                search_page=page,
+                                title=title,
+                                company=company,
+                                loc_text=loc_text,
+                                exp_text=exp_text,
                                 job_url=job_url,
-                                status=ApplicationStatus.APPLICATION_SKIPPED,
-                                match_score=score,
-                                notes=f"AI Skipped: {reason}",
-                                failure_reason="LOW_MATCH_SCORE",
-                                experience_req=exp_text
+                                score=score,
+                                stop_event=bot_state.stop_event
                             )
-                            continue
 
-                        # Ensure search page is alive
-                        if page is None or page.is_closed():
+                            # Return focus to main search page
                             try:
-                                page = context.new_page()
+                                if page and not page.is_closed():
+                                    page.bring_to_front()
                             except Exception:
                                 pass
 
-                        # Execute Unified Application Engine (Direct Naukri vs Company Portal)
-                        process_job_application(
+                        bot_state.add_log(f"Finished processing page for role '{role_name}'.", "INFO")
+                        human_sleep(2, 4, bot_state.stop_event)
+
+                    bot_state.add_log("🏁 Completed Naukri search cycle.", "SUCCESS")
+
+                # --- 2. LINKEDIN SEARCH CYCLE ---
+                if platform_up in ("ALL", "LINKEDIN") and not bot_state.stop_event.is_set():
+                    lk_today = get_today_applied_count("LINKEDIN")
+                    if lk_today < linkedin_quota:
+                        lk_locs_str = linkedin_locations or "Dubai, Qatar, Mumbai, Pune, Remote"
+                        bot_state.add_log(f"🔷 [LinkedIn Engine] Starting LinkedIn search cycle (Today: {lk_today}/{linkedin_quota})...", "INFO")
+                        linkedin_engine.run_linkedin_search_cycle(
                             context=context,
-                            search_page=page,
-                            title=title,
-                            company=company,
-                            loc_text=loc_text,
-                            exp_text=exp_text,
-                            job_url=job_url,
-                            score=score,
-                            stop_event=bot_state.stop_event
+                            target_roles=target_roles,
+                            location=lk_locs_str,
+                            stop_event=bot_state.stop_event,
+                            quota_limit=linkedin_quota
                         )
+                    else:
+                        bot_state.add_log(f"LinkedIn daily quota of {linkedin_quota} reached ({lk_today}/{linkedin_quota}). Skipping LinkedIn cycle.", "INFO")
 
-                        # Return focus to main search page
-                        try:
-                            if page and not page.is_closed():
-                                page.bring_to_front()
-                        except Exception:
-                            pass
-
-                    bot_state.add_log(f"Finished processing page for role '{role_name}'.", "INFO")
-                    human_sleep(2, 4, bot_state.stop_event)
+                # --- 3. NAUKRIGULF SEARCH CYCLE ---
+                if platform_up in ("ALL", "NAUKRIGULF") and not bot_state.stop_event.is_set():
+                    ng_today = get_today_applied_count("NAUKRIGULF")
+                    if ng_today < naukrigulf_quota:
+                        ng_locs_str = naukrigulf_locations or "Qatar, Dubai, UAE, Saudi Arabia, Remote"
+                        bot_state.add_log(f"🔷 [NaukriGulf Engine] Starting NaukriGulf search cycle (Today: {ng_today}/{naukrigulf_quota})...", "INFO")
+                        naukrigulf_engine.run_naukrigulf_search_cycle(
+                            context=context,
+                            target_roles=target_roles,
+                            locations_str=ng_locs_str,
+                            experience_years=experience_years,
+                            stop_event=bot_state.stop_event,
+                            quota_limit=naukrigulf_quota
+                        )
+                    else:
+                        bot_state.add_log(f"NaukriGulf daily quota of {naukrigulf_quota} reached ({ng_today}/{naukrigulf_quota}). Skipping NaukriGulf cycle.", "INFO")
 
                 if bot_state.stop_event.is_set():
                     bot_state.status = "STOPPED"
                     bot_state.add_log("Agent stopped by user request. Preserving state.", "WARNING")
                 else:
-                    bot_state.add_log("🏁 Completed target roles search cycle.", "SUCCESS")
+                    bot_state.add_log("🏁 Completed full autonomous job search cycle across selected platform(s).", "SUCCESS")
                     bot_state.status = "IDLE"
 
         except Exception as e:
@@ -1817,14 +2053,25 @@ def run_naukri_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)",
         if bot_state.stop_event.is_set():
             bot_state.status = "STOPPED"
 
-def start_agent_thread(keyword: str, location: str, experience: int):
+def run_naukri_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)", location: str = "Mumbai", experience_years: int = 5):
+    """Backwards compatibility wrapper for Naukri-only sync."""
+    return run_agent_sync(search_keyword, location, experience_years, platform="NAUKRI")
+
+def start_agent_thread(keyword: str, location: str, experience: int, platform: str = "ALL", 
+                       naukri_locations: str = "Mumbai, Pune, Remote", 
+                       linkedin_locations: str = "Mumbai, Pune, Qatar, Remote",
+                       naukrigulf_locations: str = "Qatar, Dubai, UAE, Saudi Arabia, Remote"):
     if bot_state.is_running:
         return False, "Agent is already running!"
     bot_state.stop_event.clear()
     bot_state.status = "CONNECTING"
-    t = threading.Thread(target=run_naukri_agent_sync, args=(keyword, location, experience), daemon=True)
+    t = threading.Thread(
+        target=run_agent_sync, 
+        args=(keyword, location, experience, platform, naukri_locations, linkedin_locations, naukrigulf_locations), 
+        daemon=True
+    )
     t.start()
-    return True, "Agent started successfully in background."
+    return True, f"Agent started successfully on {platform.upper()} in background."
 
 def stop_agent():
     bot_state.stop_event.set()

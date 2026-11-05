@@ -22,7 +22,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "block_payments": True,
         "block_sensitive_fields": True,
         "block_unverified_facts": True,
-        "max_daily_applications": 45
+        "max_daily_applications": 135,
+        "max_daily_naukri": 45,
+        "max_daily_linkedin": 45,
+        "max_daily_naukrigulf": 45
     },
     "cooldown": {
         "confirmed_min_sec": 120,

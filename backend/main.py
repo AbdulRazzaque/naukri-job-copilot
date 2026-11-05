@@ -34,8 +34,12 @@ PROFILE_PATH = os.path.join(os.path.dirname(__file__), "profile_data.json")
 
 class StartAgentRequest(BaseModel):
     keyword: str = "All Target Roles (Auto-Cycle)"
-    location: str = "Mumbai"
+    location: str = "Mumbai, Pune, Qatar, Remote"
+    naukri_locations: str = "Mumbai, Pune, Remote"
+    linkedin_locations: str = "Mumbai, Pune, Qatar, Remote"
+    naukrigulf_locations: str = "Qatar, Dubai, UAE, Saudi Arabia, Remote"
     experience: int = 5
+    platform: str = "ALL"
 
 @app.get("/api/health")
 def health():
@@ -50,8 +54,10 @@ def get_stats():
     return get_dashboard_stats()
 
 @app.get("/api/applications")
-def list_applications(limit: int = 100, status: str = None):
+def list_applications(limit: int = 100, status: str = None, platform: str = None):
     apps = get_recent_applications(limit=limit)
+    if platform and platform.upper() != "ALL":
+        apps = [a for a in apps if (a.get("platform") or "NAUKRI").upper() == platform.upper()]
     if status and status.upper() != "ALL":
         status_up = status.upper()
         if status_up == "APPLIED":
@@ -81,7 +87,15 @@ def update_agent_config(new_config: dict):
 
 @app.post("/api/start")
 def start_bot(req: StartAgentRequest):
-    success, msg = start_agent_thread(req.keyword, req.location, req.experience)
+    success, msg = start_agent_thread(
+        keyword=req.keyword,
+        location=req.location,
+        experience=req.experience,
+        platform=req.platform,
+        naukri_locations=req.naukri_locations,
+        linkedin_locations=req.linkedin_locations,
+        naukrigulf_locations=req.naukrigulf_locations
+    )
     if not success:
         raise HTTPException(status_code=400, detail=msg)
     return {"message": msg, "state": bot_state.to_dict()}

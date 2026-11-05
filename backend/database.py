@@ -59,6 +59,12 @@ def init_db():
         except Exception:
             pass  # Already exists
 
+        # Migration 3: Ensure platform column exists (NAUKRI or LINKEDIN)
+        try:
+            cursor.execute("ALTER TABLE job_applications ADD COLUMN platform VARCHAR(50) DEFAULT 'NAUKRI';")
+        except Exception:
+            pass  # Already exists
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS bot_runs (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -195,42 +201,77 @@ def get_reasoning_metrics() -> Dict[str, Any]:
         print(f"[DB] Failed to get metrics: {e}")
         return {}
 
-def get_today_applied_count() -> int:
-    """Returns number of jobs successfully applied today (CURDATE)."""
+def get_today_applied_count(platform: str = None) -> int:
+    """Returns number of jobs successfully applied today (CURDATE), optionally filtered by platform."""
     conn = get_connection()
     with conn.cursor() as cursor:
-        cursor.execute("""
-            SELECT COUNT(*) as count 
-            FROM job_applications 
-            WHERE DATE(applied_at) = CURDATE() 
-              AND status IN ('APPLIED', 'APPLICATION_CONFIRMED')
-        """)
+        if platform and platform.upper() != "ALL":
+            plat = platform.upper()
+            if plat in ("NAUKRIGULF", "GULF"):
+                cursor.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM job_applications 
+                    WHERE DATE(applied_at) = CURDATE() 
+                      AND status IN ('APPLIED', 'APPLICATION_CONFIRMED')
+                      AND UPPER(platform) IN ('NAUKRIGULF', 'GULF')
+                """)
+            else:
+                cursor.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM job_applications 
+                    WHERE DATE(applied_at) = CURDATE() 
+                      AND status IN ('APPLIED', 'APPLICATION_CONFIRMED')
+                      AND UPPER(platform) = %s
+                """, (plat,))
+        else:
+            cursor.execute("""
+                SELECT COUNT(*) as count 
+                FROM job_applications 
+                WHERE DATE(applied_at) = CURDATE() 
+                  AND status IN ('APPLIED', 'APPLICATION_CONFIRMED')
+            """)
         row = cursor.fetchone()
         conn.close()
         return row["count"] if row else 0
+
+def get_today_platform_counts() -> Dict[str, int]:
+    """Returns today's confirmed application counts categorized per platform."""
+    return {
+        "NAUKRI": get_today_applied_count("NAUKRI"),
+        "LINKEDIN": get_today_applied_count("LINKEDIN"),
+        "NAUKRIGULF": get_today_applied_count("NAUKRIGULF"),
+        "TOTAL": get_today_applied_count()
+    }
 
 def record_application(job_title: str, company_name: str, location: str, job_url: str, 
                        status: str = 'APPLICATION_CONFIRMED', apply_type: str = 'DIRECT_NAUKRI', 
                        match_score: int = 85, notes: str = "", 
                        experience_req: str = "", salary_offered: str = "",
-                       failure_reason: str = "") -> int:
+                       failure_reason: str = "", platform: str = "NAUKRI") -> int:
     conn = get_connection()
     with conn.cursor() as cursor:
-        # Check if failure_reason column exists
         try:
             cursor.execute("""
                 INSERT INTO job_applications 
-                (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered, failure_reason)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered, failure_reason))
+                (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered, failure_reason, platform)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered, failure_reason, platform.upper()))
         except Exception:
-            # Fallback if failure_reason column is not present
-            combined_notes = f"{notes} | Failure: {failure_reason}".strip(" |") if failure_reason else notes
-            cursor.execute("""
-                INSERT INTO job_applications 
-                (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (job_title, company_name, location, job_url, status, apply_type, match_score, combined_notes, experience_req, salary_offered))
+            # Fallback if platform column is not present
+            try:
+                cursor.execute("""
+                    INSERT INTO job_applications 
+                    (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered, failure_reason)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered, failure_reason))
+            except Exception:
+                # Fallback if failure_reason is also not present
+                combined_notes = f"[{platform.upper()}] {notes} | Failure: {failure_reason}".strip(" |") if failure_reason else f"[{platform.upper()}] {notes}"
+                cursor.execute("""
+                    INSERT INTO job_applications 
+                    (job_title, company_name, location, job_url, status, apply_type, match_score, notes, experience_req, salary_offered)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (job_title, company_name, location, job_url, status, apply_type, match_score, combined_notes, experience_req, salary_offered))
 
         app_id = cursor.lastrowid
         conn.close()
@@ -292,16 +333,58 @@ def get_dashboard_stats() -> Dict[str, Any]:
         """)
         common_causes = cursor.fetchall() or []
 
+        naukri_applied = 0
+        linkedin_applied = 0
+        naukrigulf_applied = 0
+        today_naukri = 0
+        today_linkedin = 0
+        today_naukrigulf = 0
+
+        try:
+            # All-time applied counts per platform
+            cursor.execute("SELECT COUNT(*) as cnt FROM job_applications WHERE UPPER(platform) = 'NAUKRI' AND status IN ('APPLIED', 'APPLICATION_CONFIRMED')")
+            naukri_applied = cursor.fetchone()["cnt"]
+            cursor.execute("SELECT COUNT(*) as cnt FROM job_applications WHERE UPPER(platform) = 'LINKEDIN' AND status IN ('APPLIED', 'APPLICATION_CONFIRMED')")
+            linkedin_applied = cursor.fetchone()["cnt"]
+            cursor.execute("SELECT COUNT(*) as cnt FROM job_applications WHERE UPPER(platform) IN ('NAUKRIGULF', 'GULF') AND status IN ('APPLIED', 'APPLICATION_CONFIRMED')")
+            naukrigulf_applied = cursor.fetchone()["cnt"]
+
+            # Today's applied counts per platform (CURDATE)
+            cursor.execute("SELECT COUNT(*) as cnt FROM job_applications WHERE UPPER(platform) = 'NAUKRI' AND status IN ('APPLIED', 'APPLICATION_CONFIRMED') AND DATE(applied_at) = CURDATE()")
+            today_naukri = cursor.fetchone()["cnt"]
+            cursor.execute("SELECT COUNT(*) as cnt FROM job_applications WHERE UPPER(platform) = 'LINKEDIN' AND status IN ('APPLIED', 'APPLICATION_CONFIRMED') AND DATE(applied_at) = CURDATE()")
+            today_linkedin = cursor.fetchone()["cnt"]
+            cursor.execute("SELECT COUNT(*) as cnt FROM job_applications WHERE UPPER(platform) IN ('NAUKRIGULF', 'GULF') AND status IN ('APPLIED', 'APPLICATION_CONFIRMED') AND DATE(applied_at) = CURDATE()")
+            today_naukrigulf = cursor.fetchone()["cnt"]
+        except Exception:
+            naukri_applied = total_applied
+            linkedin_applied = 0
+            naukrigulf_applied = 0
+
         conn.close()
         return {
             # Legacy metrics for existing frontend components
             "total_applied": total_applied,
             "today_applied": today_applied,
-            "daily_safe_limit": 45,
-            "remaining_today": max(0, 45 - today_applied),
+            "daily_safe_limit": 135,
+            "remaining_today": max(0, 135 - today_applied),
             "external_redirects": total_redirects,
             "failed_attempts": total_failed,
             "needs_user_input": total_needs_input,
+            # Platform breakdown metrics (All-time)
+            "naukri_applied": naukri_applied,
+            "linkedin_applied": linkedin_applied,
+            "naukrigulf_applied": naukrigulf_applied,
+            # Individual Daily Platform Quotas & Progress
+            "today_naukri": today_naukri,
+            "today_linkedin": today_linkedin,
+            "today_naukrigulf": today_naukrigulf,
+            "quota_naukri": 45,
+            "quota_linkedin": 45,
+            "quota_naukrigulf": 45,
+            "remaining_naukri": max(0, 45 - today_naukri),
+            "remaining_linkedin": max(0, 45 - today_linkedin),
+            "remaining_naukrigulf": max(0, 45 - today_naukrigulf),
             # Enhanced dashboard summary metrics
             "completed_applications": total_completed,
             "confirmed_submissions": total_applied,
@@ -310,6 +393,36 @@ def get_dashboard_stats() -> Dict[str, Any]:
             "failed_applications": total_failed,
             "common_failure_causes": common_causes
         }
+
+def format_final_application_report(company_name: str, job_title: str, job_location: str,
+                                    platform: str = "LinkedIn", application_type: str = "Easy Apply",
+                                    resume_status: str = "Uploaded", phone_number: str = "+91 797269663",
+                                    country_code: str = "+91", email_verification: str = "Not Required",
+                                    form_validation: str = "Passed", application_status: str = "Submitted") -> str:
+    """
+    MASTER PROMPT SECTION 17:
+    Standard Final Application Report markdown generator.
+    """
+    from datetime import datetime
+    app_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report = f"""
+### Final Application Report
+| Field | Details |
+|---|---|
+| Company Name | {company_name or 'N/A'} |
+| Job Designation | {job_title or 'N/A'} |
+| Job Location | {job_location or 'N/A'} |
+| Application Platform | {platform} |
+| Application Type | {application_type} |
+| Resume | {resume_status} |
+| Phone Number | {phone_number} |
+| Country Code | {country_code} |
+| Email Verification | {email_verification} |
+| Form Validation | {form_validation} |
+| Application Status | {application_status} |
+| Application Date | {app_date} |
+"""
+    return report.strip()
 
 if __name__ == "__main__":
     init_db()
