@@ -26,6 +26,15 @@ venv/
 .env.local
 .env.*.local
 
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Screenshots and generated batch resumes
+backend/screenshots/
+backend/customized_resumes/
+
 # Logs
 *.log
 npm-debug.log*

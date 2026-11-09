@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import json
 import asyncio
 import random
 import time
@@ -20,7 +21,9 @@ from database import (
     get_today_applied_count, 
     record_application, 
     log_event, 
-    get_connection
+    get_connection,
+    format_final_application_report,
+    check_already_applied_db
 )
 from ai_service import (
     evaluate_job_relevance, 
@@ -43,6 +46,7 @@ from question_answering import (
     qa_engine,
     match_best_option
 )
+from candidate_manager import getCandidateProfileByJobLocation, CandidateProfileManager, mask_phone_number
 from chat_panel_handler import naukri_chat_panel_handler, ChatPanelState
 from reasoning_engine import reasoning_engine, AutonomousReasoningEngine
 from button_service import button_service, is_naukri_application_confirmed
@@ -142,6 +146,17 @@ class BotState:
             "NAUKRIGULF": 0
         }
         self.last_error = ""
+        self.last_search_diagnostics = {
+            "requestedLocation": "",
+            "actualBrowserLocation": "",
+            "locationVerified": False,
+            "searchKeyword": "",
+            "searchUrl": "",
+            "linkedinResultCount": 0,
+            "extractedJobCount": 0,
+            "locationSyncStatus": "IDLE",
+            "extractionStatus": "IDLE"
+        }
         self.stop_event = threading.Event()
         self.logs: List[Dict[str, str]] = []
         self.config = BotConfig()
@@ -175,28 +190,12 @@ class BotState:
             "platform_quotas": self.platform_quotas,
             "platform_applied": self.platform_applied,
             "last_error": self.last_error,
-            "recent_logs": self.logs[:15],
-            "config": self.config.to_dict()
+            "recent_logs": self.logs[:60],
+            "config": self.config.to_dict(),
+            "last_search_diagnostics": self.last_search_diagnostics
         }
 
 bot_state = BotState()
-
-def check_already_applied_db(title: str, company: str) -> bool:
-    """Checks if we have already recorded an application for this title & company with a confirmed or pending status."""
-    try:
-        conn = get_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT id FROM job_applications 
-                WHERE job_title = %s AND company_name = %s 
-                  AND status IN ('APPLIED', 'APPLICATION_CONFIRMED', 'REDIRECT_REVIEW', 'APPLICATION_PENDING_CONFIRMATION')
-                LIMIT 1
-            """, (title, company))
-            row = cursor.fetchone()
-            conn.close()
-            return row is not None
-    except Exception:
-        return False
 
 def human_sleep(min_sec: float, max_sec: float, stop_event: threading.Event):
     """Sleeps with random jitter while respecting user stop request."""
@@ -262,6 +261,7 @@ def find_submit_button(page):
         "send",
         "apply now",
         "apply for this job",
+        "apply",
         "continue",
         "next"
     ]
@@ -546,11 +546,11 @@ def fill_company_form(target_page, stop_event: threading.Event, target_role: str
     """
     profile = get_candidate_profile()
 
-    # Resolve resume path
-    resume_path = profile.get("resume_path") or ""
+    # Centralized Country-Based Candidate Profile
+    cand_prof = getCandidateProfileByJobLocation(location_hint)
+    resume_path = cand_prof.get("resume_path") or ""
     if not resume_path or not os.path.exists(resume_path):
-        is_gulf_target = any(k in (location_hint or "").lower() for k in ["qatar", "doha", "dubai", "uae", "emirates", "abu dhabi", "sharjah"])
-        target_res = "Abdul_Razzaque_Qatar.pdf" if is_gulf_target else "Abdul_Razzaque_India.pdf"
+        target_res = cand_prof.get("resume_filename", "Abdul_Razzaque_India.pdf")
         candidate_paths = [
             os.path.join(os.path.dirname(__file__), target_res),
             os.path.join(os.path.dirname(__file__), "Abdul_Razzaque_India.pdf"),
@@ -901,196 +901,46 @@ def handle_naukri_screening_drawer(detail_tab, stop_event: threading.Event, comp
 
 def handle_external_company_portal(context, detail_tab, company_tab, title: str, company: str, 
                                    loc_text: str, exp_text: str, score: int, 
-                                   stop_event: threading.Event) -> Dict[str, Any]:
+                                   stop_event: threading.Event,
+                                   tailored_resume_path: str = "",
+                                   original_job_url: str = "",
+                                   platform: str = "NAUKRI",
+                                   requested_location: str = "",
+                                   actual_browser_location: str = "") -> Dict[str, Any]:
     """
-    Handles applications on external company career portals:
-    - Auto-fills candidate fields and attaches PDF resume
-    - Detects CAPTCHA challenges or login/password barriers
-    - Safely locates submit button and evaluates confirmation
-    - Preserves unconfirmed external applications as PENDING_CONFIRMATION for manual review
+    Handles applications on external company career portals using the full 12-stage ExternalApplyEngine:
+    - Verifies external job title & company (prevents 404/expired/mismatch)
+    - Detects & reveals application form controls
+    - Fills verified candidate details grounded in profile
+    - Uploads tailored/verified PDF resume
+    - Validates entire form pre-submission
+    - Detects CAPTCHA / Login and keeps tab open safely
+    - Submits and verifies confirmation
     """
-    ext_url = company_tab.url
-    bot_state.add_log(f"🌐 Landed on Company Website: {ext_url[:75]}...", "INFO")
-
-    if stop_event and stop_event.is_set():
-        return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "STOP_REQUESTED", "attempted": False}
-
-    try:
-        # Check if portal requires clicking an internal 'Apply' / 'Apply Now' button first
-        portal_apply_btn = company_tab.query_selector("""
-            button:has-text('Apply Now'), 
-            a:has-text('Apply Now'), 
-            button:has-text('Apply for this job'), 
-            a:has-text('Apply for this job'),
-            button:has-text('Apply'), 
-            a:has-text('Apply')
-        """)
-        if portal_apply_btn and portal_apply_btn.is_visible() and portal_apply_btn.is_enabled():
-            btn_txt = (portal_apply_btn.inner_text() or "").strip()
-            if "filter" not in btn_txt.lower() and "search" not in btn_txt.lower():
-                bot_state.add_log(f"Clicking '{btn_txt}' on company portal...", "INFO")
-                portal_apply_btn.scroll_into_view_if_needed()
-                portal_apply_btn.click()
-                human_sleep(2.5, 4.0, stop_event)
-
-        # Visually Fill Form on Company Site (Resume, Dropdowns, Radios, Checkboxes, Inputs, DOB)
-        bot_state.add_log(f"✍️ Visually filling candidate information & resume on {company} portal...", "INFO")
-        fill_res = fill_company_form(company_tab, stop_event, target_role=title, company_name=company, location_hint=loc_text)
-        human_sleep(2, 3, stop_event)
-
-        if isinstance(fill_res, dict) and fill_res.get("is_payment"):
-            bot_state.add_log(f"🚨 Payment or transaction requested on {company} portal. Blocked by safety boundary!", "ERROR")
-            record_application(
-                job_title=title, company_name=company, location=loc_text, job_url=ext_url,
-                status=ApplicationStatus.APPLICATION_FAILED, apply_type='COMPANY_WEBSITE', match_score=score,
-                notes="Payment or fee requested by portal. Blocked by safety policy.",
-                failure_reason="PAYMENT_BLOCKED",
-                experience_req=exp_text
-            )
-            return {"status": ApplicationStatus.APPLICATION_FAILED, "success": False, "failure_reason": "PAYMENT_BLOCKED", "attempted": True}
-
-        if isinstance(fill_res, dict) and fill_res.get("needs_user_input"):
-            reason = fill_res.get("reason", "NEEDS_USER_INPUT")
-            bot_state.add_log(f"⚠️ [NEEDS_USER_INPUT] Mandatory question on {company} portal requires candidate input ({reason}). Tab kept OPEN in Chrome!", "WARNING")
-            safe_bring_to_front(company_tab)
-            record_application(
-                job_title=title, company_name=company, location=loc_text, job_url=ext_url,
-                status=ApplicationStatus.NEEDS_USER_INPUT, apply_type='COMPANY_WEBSITE', match_score=score,
-                notes=f"Form requires candidate verification: {reason}. Tab kept open in Chrome.",
-                failure_reason=reason,
-                experience_req=exp_text
-            )
-            try:
-                if detail_tab and detail_tab != company_tab and not detail_tab.is_closed():
-                    detail_tab.close()
-            except Exception:
-                pass
-            human_sleep(2, 3, stop_event)
-            return {"status": ApplicationStatus.NEEDS_USER_INPUT, "success": False, "failure_reason": reason, "attempted": True}
-
-        if stop_event and stop_event.is_set():
-            return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "STOP_REQUESTED", "attempted": True}
-
-        # Check for CAPTCHA or Password protection
-        has_captcha = company_tab.query_selector("iframe[src*='recaptcha'], iframe[src*='hcaptcha'], .g-recaptcha, .cf-turnstile")
-        has_password = company_tab.query_selector("input[type='password']")
-
-        if has_captcha or has_password:
-            bot_state.add_log(f"🤖 CAPTCHA challenge or Account Login detected on {company} portal. Leaving tab OPEN in Chrome for you!", "WARNING")
-            safe_bring_to_front(company_tab)
-            record_application(
-                job_title=title, company_name=company, location=loc_text, job_url=ext_url,
-                status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
-                notes="Form auto-filled. CAPTCHA / Account Login requires user confirmation. Tab kept open.",
-                failure_reason="CAPTCHA_OR_LOGIN_REQUIRED",
-                experience_req=exp_text
-            )
-            try:
-                if detail_tab and detail_tab != company_tab and not detail_tab.is_closed():
-                    detail_tab.close()
-            except Exception:
-                pass
-            human_sleep(2, 3, stop_event)
-            return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "success": False, "failure_reason": "CAPTCHA_OR_LOGIN_REQUIRED", "attempted": True}
-
-        # Check authorization: is auto_submit_company_portal allowed?
-        if not agent_config_manager.is_authorized("auto_submit_company_portal"):
-            bot_state.add_log(f"Form filled on {company} portal. Auto-submit on company portal is disabled by config. Tab kept OPEN for review.", "INFO")
-            safe_bring_to_front(company_tab)
-            record_application(
-                job_title=title, company_name=company, location=loc_text, job_url=ext_url,
-                status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
-                notes="Form filled. Company portal auto-submit not authorized. Tab kept open.",
-                failure_reason="AUTO_SUBMIT_COMPANY_PORTAL_NOT_AUTHORIZED",
-                experience_req=exp_text
-            )
-            try:
-                if detail_tab and detail_tab != company_tab and not detail_tab.is_closed():
-                    detail_tab.close()
-            except Exception:
-                pass
-            return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "success": False, "failure_reason": "AUTO_SUBMIT_COMPANY_PORTAL_NOT_AUTHORIZED", "attempted": True}
-
-        # Look for Submit Application button
-        submit_btn = find_submit_button(company_tab)
-
-        if submit_btn and submit_btn.is_visible() and submit_btn.is_enabled():
-            bot_state.add_log(f"Clicking Submit on company portal for {company}...", "INFO")
-            submit_btn.scroll_into_view_if_needed()
-            submit_btn.hover()
-            time.sleep(0.4)
-            submit_btn.click()
-            human_sleep(4, 6, stop_event)
-
-            # Verify if submission was actually successful vs rejected / has validation errors
-            sub_status = company_tab.evaluate("""() => {
-                const text = (document.body ? document.body.innerText : '').toLowerCase();
-                const url = window.location.href.toLowerCase();
-                const isSuccessUrl = url.includes('success') || url.includes('thank-you') || url.includes('confirmation') || url.includes('submitted');
-                const headers = Array.from(document.querySelectorAll('h1, h2, h3, .success, .alert-success')).map(h => h.innerText.toLowerCase()).join(' ');
-                const isSuccessHeader = headers.includes('thank you for applying') || 
-                                       headers.includes('application submitted') || 
-                                       headers.includes('application received') || 
-                                       headers.includes('successfully applied') ||
-                                       headers.includes('your response has been recorded');
-                const hasErrors = !!document.querySelector('.error, .alert-danger, .invalid-feedback, :invalid');
-                const hasVisibleInputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea')).some(i => i.offsetParent !== null && !i.value);
-                return { success: (isSuccessUrl || isSuccessHeader) && !hasVisibleInputs, hasErrors: hasErrors };
-            }""")
-
-            if sub_status.get("success") and not sub_status.get("hasErrors"):
-                record_application(
-                    job_title=title, company_name=company, location=loc_text, job_url=ext_url,
-                    status=ApplicationStatus.APPLICATION_CONFIRMED, apply_type='COMPANY_WEBSITE', match_score=score,
-                    notes="Successfully auto-filled and submitted on company careers website.",
-                    experience_req=exp_text
-                )
-                bot_state.today_applied = get_today_applied_count()
-                bot_state.add_log(f"✅ Application SUCCESS on Company Website! [{bot_state.today_applied}/{bot_state.daily_limit}] for {title} @ {company}", "SUCCESS")
-                try:
-                    if detail_tab and detail_tab != company_tab and not detail_tab.is_closed():
-                        detail_tab.close()
-                except Exception:
-                    pass
-                cooldown_timer(min_sec=bot_state.config.cooldown_min_sec, max_sec=bot_state.config.cooldown_max_sec, stop_event=stop_event, reason=f"Confirmed company website submission for {company}")
-                return {"status": ApplicationStatus.APPLICATION_CONFIRMED, "success": True, "failure_reason": "", "attempted": True}
-            else:
-                bot_state.add_log(f"⚠️ Form filled for {company}. Tab kept OPEN in Chrome for your review!", "WARNING")
-                safe_bring_to_front(company_tab)
-                record_application(
-                    job_title=title, company_name=company, location=loc_text, job_url=ext_url,
-                    status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
-                    notes="Form filled. Kept open in Chrome for candidate review/confirmation.",
-                    failure_reason="CONFIRMATION_UNCERTAIN",
-                    experience_req=exp_text
-                )
-                try:
-                    if detail_tab and detail_tab != company_tab and not detail_tab.is_closed():
-                        detail_tab.close()
-                except Exception:
-                    pass
-                cooldown_timer(min_sec=bot_state.config.unconfirmed_cooldown_min_sec, max_sec=bot_state.config.unconfirmed_cooldown_max_sec, stop_event=stop_event, reason=f"Safety pause for {company}")
-                return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "success": False, "failure_reason": "CONFIRMATION_UNCERTAIN", "attempted": True}
-        else:
-            bot_state.add_log(f"Form filled on {company} portal. Tab kept OPEN in Chrome for final submission.", "WARNING")
-            safe_bring_to_front(company_tab)
-            record_application(
-                job_title=title, company_name=company, location=loc_text, job_url=ext_url,
-                status=ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, apply_type='COMPANY_WEBSITE', match_score=score,
-                notes="Form auto-filled. Left open in Chrome for candidate to review.",
-                failure_reason="SUBMIT_BUTTON_NOT_FOUND",
-                experience_req=exp_text
-            )
-            try:
-                if detail_tab and detail_tab != company_tab and not detail_tab.is_closed():
-                    detail_tab.close()
-            except Exception:
-                pass
-            human_sleep(2, 4, stop_event)
-            return {"status": ApplicationStatus.APPLICATION_PENDING_CONFIRMATION, "success": False, "failure_reason": "SUBMIT_BUTTON_NOT_FOUND", "attempted": True}
-    except Exception as e:
-        bot_state.add_log(f"Company portal error for {company}: {e}", "WARNING")
-        return {"status": ApplicationStatus.APPLICATION_FAILED, "success": False, "failure_reason": str(e), "attempted": True}
+    from external_apply_engine import ExternalApplyEngine
+    engine = ExternalApplyEngine(bot_state=bot_state)
+    result = engine.execute_external_application(
+        context=context,
+        detail_tab=detail_tab,
+        company_tab=company_tab,
+        title=title,
+        company=company,
+        loc_text=loc_text,
+        exp_text=exp_text,
+        score=score,
+        tailored_resume_path=tailored_resume_path,
+        original_job_url=original_job_url or (detail_tab.url if detail_tab else ""),
+        platform=platform,
+        stop_event=stop_event,
+        requested_location=requested_location,
+        actual_browser_location=actual_browser_location
+    )
+    if result.get("status") == "APPLICATION_CONFIRMED":
+        bot_state.today_applied = get_today_applied_count()
+        cooldown_timer(min_sec=bot_state.config.cooldown_min_sec, max_sec=bot_state.config.cooldown_max_sec, stop_event=stop_event, reason=f"Confirmed company website submission for {company}")
+    else:
+        cooldown_timer(min_sec=bot_state.config.unconfirmed_cooldown_min_sec, max_sec=bot_state.config.unconfirmed_cooldown_max_sec, stop_event=stop_event, reason=f"Safety pause for {company}")
+    return result
 
 def process_job_application(context, search_page, title: str, company: str, loc_text: str, exp_text: str, job_url: str, score: int, stop_event: threading.Event) -> Dict[str, Any]:
     """
@@ -1108,6 +958,10 @@ def process_job_application(context, search_page, title: str, company: str, loc_
 
     if stop_event and stop_event.is_set():
         return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "STOP_REQUESTED", "attempted": False}
+
+    if check_already_applied_db(title=title, company=company, job_url=job_url):
+        bot_state.add_log(f"🔁 Job {title} @ {company} already applied or skipped in DB. Skipping.", "INFO")
+        return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "DUPLICATE_JOB", "attempted": False}
 
     if not agent_config_manager.is_authorized("auto_inspect_jobs"):
         bot_state.add_log(f"auto_inspect_jobs disabled in agent config. Skipping inspection of {company}.", "INFO")
@@ -1179,6 +1033,49 @@ def process_job_application(context, search_page, title: str, company: str, loc_
             detail_tab.close()
             return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "GULF_REGION_EXCLUDED", "attempted": False}
 
+        # Step 1.5: Master Prompt Section 2 & 3: Deep JD Analysis & Resume Optimization
+        jd_text = ""
+        try:
+            jd_el = detail_tab.query_selector(".styles_JDC__dang-inner-html__73O4f, .job-desc-wrap, .dang-inner-html, section.job-desc, article")
+            if jd_el:
+                jd_text = jd_el.inner_text().strip()
+        except Exception:
+            pass
+        if not jd_text:
+            jd_text = f"{title} at {company} in {loc_text}. Experience: {exp_text}"
+
+        from resume_optimizer import analyze_job_description, resume_optimizer, generate_activity_report
+        jd_analysis = analyze_job_description(
+            job_title=title, company=company, job_desc=jd_text, location=loc_text, job_url=full_job_url, platform="NAUKRI"
+        )
+
+        # SCENARIO C: Strict Disqualification Check
+        if not jd_analysis.should_apply:
+            bot_state.add_log(f"🛑 [Incompatible Role Disqualified] {title} @ {company}: {jd_analysis.disqualification_reason}", "WARNING")
+            skip_rep = generate_activity_report(
+                jd_analysis=jd_analysis,
+                optimization_res={"success": False, "customized_path": "", "original_path": ""},
+                application_status="Skipped (Incompatible Role)",
+                error_msg=jd_analysis.disqualification_reason
+            )
+            bot_state.add_log(f"📋 Application Report:\n{skip_rep}", "INFO")
+            record_application(
+                job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
+                status=ApplicationStatus.APPLICATION_SKIPPED, apply_type='DIRECT_NAUKRI',
+                match_score=jd_analysis.match_score,
+                notes=f"Skipped: {jd_analysis.disqualification_reason}",
+                failure_reason=jd_analysis.disqualification_reason,
+                experience_req=exp_text, platform="NAUKRI",
+                jd_match_analysis_json=json.dumps(jd_analysis.to_dict())
+            )
+            detail_tab.close()
+            return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": jd_analysis.disqualification_reason, "attempted": False}
+
+        opt_res = resume_optimizer.optimize_resume(jd_analysis, is_india=True)
+        custom_pdf = opt_res.get("customized_path") if opt_res.get("success") else resume_optimizer.get_base_resume(is_india=True)
+        if opt_res.get("success"):
+            bot_state.add_log(f"📄 [Resume Optimized] Generated tailored CV: {os.path.basename(custom_pdf)} (Match: {jd_analysis.match_score}%)", "SUCCESS")
+
         # Step 2: Locate Action Button (detect_naukri_action_button)
         action_type, action_btn = detect_naukri_action_button(detail_tab)
 
@@ -1236,7 +1133,10 @@ def process_job_application(context, search_page, title: str, company: str, loc_
             return handle_external_company_portal(
                 context=context, detail_tab=detail_tab, company_tab=company_tab,
                 title=title, company=company, loc_text=loc_text, exp_text=exp_text,
-                score=score, stop_event=stop_event
+                score=score, stop_event=stop_event,
+                tailored_resume_path=custom_pdf,
+                original_job_url=full_job_url,
+                platform="NAUKRI"
             )
 
         # CASE 2: DIRECT APPLY ON NAUKRI (OR REDIRECT VIA APPLY)
@@ -1286,7 +1186,10 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                     return handle_external_company_portal(
                         context=context, detail_tab=detail_tab, company_tab=company_tab,
                         title=title, company=company, loc_text=loc_text, exp_text=exp_text,
-                        score=score, stop_event=stop_event
+                        score=score, stop_event=stop_event,
+                        tailored_resume_path=custom_pdf,
+                        original_job_url=full_job_url,
+                        platform="NAUKRI"
                     )
 
             # SUBCASE 2B: Clicking Apply redirected detail_tab to external site (not naukri.com)
@@ -1295,7 +1198,10 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                 return handle_external_company_portal(
                     context=context, detail_tab=detail_tab, company_tab=detail_tab,
                     title=title, company=company, loc_text=loc_text, exp_text=exp_text,
-                    score=score, stop_event=stop_event
+                    score=score, stop_event=stop_event,
+                    tailored_resume_path=custom_pdf,
+                    original_job_url=full_job_url,
+                    platform="NAUKRI"
                 )
 
             # SUBCASE 2C: Standard Direct Apply on Naukri (Chatbot drawer or 1-Click apply)
@@ -1462,13 +1368,38 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                 pass
 
             if confirmed:
+                activity_rep = generate_activity_report(
+                    jd_analysis=jd_analysis,
+                    optimization_res=opt_res,
+                    application_status="Applied Successfully"
+                )
+                bot_state.add_log(f"📋 Application Activity Report:\n{activity_rep}", "SUCCESS")
                 record_application(
                     job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
-                    status=ApplicationStatus.APPLICATION_CONFIRMED, apply_type='DIRECT_NAUKRI', match_score=score,
-                    notes="Successfully applied via Naukri Direct Apply.", experience_req=exp_text
+                    status=ApplicationStatus.APPLICATION_CONFIRMED, apply_type='DIRECT_NAUKRI', match_score=jd_analysis.match_score,
+                    notes=f"Successfully applied via Naukri Direct Apply. Match: {jd_analysis.match_score}%.",
+                    experience_req=exp_text, platform="NAUKRI",
+                    customized_resume_path=custom_pdf,
+                    original_resume_path=opt_res.get("original_path", ""),
+                    cv_changes_json=json.dumps(opt_res),
+                    jd_match_analysis_json=json.dumps(jd_analysis.to_dict())
                 )
                 bot_state.today_applied = get_today_applied_count()
                 bot_state.add_log(f"✅ Application SUCCESS via Direct Apply! [{bot_state.today_applied}/{bot_state.daily_limit}] for {title} @ {company}", "SUCCESS")
+                naukri_rep = format_final_application_report(
+                    company_name=company,
+                    job_title=title,
+                    job_location=loc_text,
+                    platform="Naukri",
+                    application_type="Apply",
+                    jd_match=f"{jd_analysis.match_score}%",
+                    resume_customized="Yes" if custom_pdf else "No",
+                    resume_uploaded="Yes",
+                    application_status="Yes",
+                    submission_verified="Yes",
+                    pending_action="None"
+                )
+                bot_state.add_log(f"📋 Application Report (Section 7):\n{naukri_rep}", "SUCCESS")
 
                 try:
                     detail_tab.close()
@@ -1518,19 +1449,57 @@ def process_job_application(context, search_page, title: str, company: str, loc_
                 return {"status": ApplicationStatus.APPLICATION_FAILED, "success": False, "failure_reason": failure_reason, "attempted": True}
 
         else:
+            # Check if job description contains an HR / careers email address
+            from email_service import extract_hiring_emails, open_outlook_for_job_application
+            emails = extract_hiring_emails(detail_tab, jd_text=jd_text)
+            if emails:
+                target_email = emails[0]
+                bot_state.add_log(f"📧 [Email Application] Found hiring email for {company}: {target_email}! Opening Outlook...", "INFO")
+                opened, reason = open_outlook_for_job_application(
+                    recipient_email=target_email,
+                    job_title=title,
+                    company_name=company,
+                    location=loc_text,
+                    context_text=f"Company: {company}, Role: {title}"
+                )
+                if opened:
+                    bot_state.add_log(f"✅ {reason}", "SUCCESS")
+                    try:
+                        detail_tab.close()
+                    except Exception:
+                        pass
+                    cooldown_timer(min_sec=30, max_sec=60, stop_event=stop_event, reason=f"Outlook email composed for {company}")
+                    return {"status": ApplicationStatus.APPLICATION_CONFIRMED, "success": True, "failure_reason": "", "attempted": True}
+
+            # 6. Capture screenshot when button detection fails
+            screenshot_path = ""
+            try:
+                os.makedirs("backend/screenshots", exist_ok=True)
+                safe_comp = re.sub(r'[^a-zA-Z0-9]', '_', company)[:20]
+                screenshot_path = f"backend/screenshots/apply_option_failed_{safe_comp}_{int(time.time())}.png"
+                detail_tab.screenshot(path=screenshot_path)
+            except Exception:
+                pass
+
             bot_state.add_log(f"No active Apply or Company Site button found on page for {company}. Skipping.", "WARNING")
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=full_job_url,
                 status=ApplicationStatus.APPLICATION_SKIPPED, apply_type='DIRECT_NAUKRI', match_score=score,
-                notes="No active Apply or Company Site button found.", failure_reason="NO_APPLY_BUTTON",
-                experience_req=exp_text
+                skip_reason_code="APPLY_OPTION_NOT_AVAILABLE",
+                failure_reason="APPLY_OPTION_NOT_AVAILABLE",
+                execution_stage="ACTION_BUTTON_DETECTION",
+                detailed_explanation="The job is eligible, but no application option was found after inspection.",
+                notes="No active Apply or Company Site button found.",
+                screenshot_reference=screenshot_path,
+                experience_req=exp_text,
+                platform="NAUKRI"
             )
             try:
                 detail_tab.close()
             except Exception:
                 pass
             human_sleep(1.5, 3.0, stop_event)
-            return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "NO_APPLY_BUTTON", "attempted": False}
+            return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "APPLY_OPTION_NOT_AVAILABLE", "attempted": False}
 
     except Exception as e:
         bot_state.add_log(f"Error while processing application for {company}: {e}", "WARNING")
@@ -1542,8 +1511,14 @@ def process_job_application(context, search_page, title: str, company: str, loc_
         record_application(
             job_title=title, company_name=company, location=loc_text, job_url=job_url,
             status=ApplicationStatus.APPLICATION_FAILED, apply_type='DIRECT_NAUKRI', match_score=score,
-            notes=f"Exception during processing: {e}", failure_reason=str(e),
-            experience_req=exp_text
+            skip_reason_code="APPLICATION_BLOCKED",
+            failure_reason="APPLICATION_BLOCKED",
+            error_message=str(e),
+            execution_stage="APPLICATION_EXECUTION",
+            detailed_explanation=f"An application option was found, but the automation could not execute the action: {e}",
+            notes=f"Exception during processing: {e}",
+            experience_req=exp_text,
+            platform="NAUKRI"
         )
         # Apply safety cooldown on exception after attempt
         cooldown_timer(min_sec=bot_state.config.unconfirmed_cooldown_min_sec, max_sec=bot_state.config.unconfirmed_cooldown_max_sec, stop_event=stop_event, reason=f"Safety pause after error on {company}")
@@ -1573,30 +1548,21 @@ DEFAULT_TARGET_ROLES = [
     {"name": "Next.js Developer", "slug": "next-js-developer"}
 ]
 
-def is_job_title_blacklisted(title: str) -> Tuple[bool, str]:
+def is_job_title_blacklisted(title: str, desc: str = "") -> Tuple[bool, str, str]:
     """
-    STRICT CANDIDATE RULE:
-    Reject Java / Java Full Stack / Spring Boot / .NET / C# / PHP roles.
-    Candidate specializes strictly in MERN Stack (React, Node, Express, MongoDB, JavaScript, TypeScript).
-    Note: Must use regex word boundary \bjava\b so 'javascript' is NEVER blocked!
+    Candidate Technology Profile & Flexible Job Matching:
+    - Evaluates role using technology_matcher.
+    - APPLY for relevant mixed-technology roles (MERN + Python, MERN + .NET/C#, React + Node + Python).
+    - SKIP dedicated specialist roles (Dedicated Python, Dedicated .NET, Dedicated Java).
+    - Returns (is_blocked: bool, reason: str, reason_code: str)
     """
     if not title:
-        return False, ""
-    t_low = title.lower().strip()
-
-    # Distinguish 'java' from 'javascript' using word boundary
-    is_java = bool(re.search(r"\bjava\b", t_low)) and not bool(re.search(r"\bjavascript\b", t_low))
-    has_java_phrases = bool(re.search(r"\b(spring boot|springboot|j2ee|hibernate|core java|java developer|java full stack|full stack java|java backend|java engineer|java software)\b", t_low))
-    if is_java or has_java_phrases:
-        return True, "Java / Spring Boot role (Candidate is strictly MERN / JavaScript Full Stack, not Java)"
-
-    if any(k in t_low for k in [".net", "dotnet", "c#", "asp.net"]):
-        return True, ".NET / C# role (Candidate is strictly MERN / JavaScript Full Stack)"
-
-    if bool(re.search(r"\b(php|laravel|wordpress|ruby|rails)\b", t_low)):
-        return True, "Non-MERN backend role (Candidate is strictly MERN / JavaScript Full Stack)"
-
-    return False, ""
+        return False, "", ""
+    from technology_matcher import evaluate_technology_alignment
+    res = evaluate_technology_alignment(title=title, desc=desc)
+    if not res["should_apply"]:
+        return True, res["detailed_explanation"], res.get("reason_code", "PRIMARY_SPECIALIZATION_MISMATCH")
+    return False, "", ""
 
 def format_naukri_slug(keyword: str) -> str:
     cleaned = keyword.lower().replace(".", "-").replace("/", "-")
@@ -1634,44 +1600,13 @@ def parse_target_locations(location_input: str, default_locs: List[str] = None) 
 
 def is_naukri_location_valid(loc_text: str, allowed_locations: List[str] = None) -> bool:
     """
-    STRICT CANDIDATE RULE: Restrict Naukri.com applications strictly to Mumbai, Pune, and Remote.
-    Jobs located in Noida, Gurugram, Gurgaon, Kolkata, Delhi/NCR, Bengaluru, Hyderabad, etc.
-    MUST be strictly filtered out and never applied to or queued.
+    CRITICAL PATCH: Unified Location Matching
+    Splits multi-location strings into individual locations and verifies independently.
+    Never marks a job LOCATION_MISMATCH if at least one valid preferred location matches.
     """
-    if not loc_text:
-        return True
-    
-    lt = loc_text.lower().strip()
-    
-    # Allowed locations & sub-localities
-    valid_terms = [
-        "mumbai", "navi mumbai", "thane", "kurla", "andheri", "bkc",
-        "pune", "hinjewadi", "hinjawadi", "magarpatta", "kharadi", "baner", "wakad", "yerwada",
-        "remote", "wfh", "work from home", "anywhere in india", "pan india"
-    ]
-    has_valid_term = any(v in lt for v in valid_terms)
-    
-    # Explicitly non-permitted locations
-    disallowed_terms = [
-        "noida", "gurugram", "gurgaon", "delhi", "ncr", "kolkata", "bengaluru", "bangalore",
-        "hyderabad", "secunderabad", "chennai", "ahmedabad", "jaipur", "chandigarh", "lucknow", "indore"
-    ]
-    
-    if not has_valid_term:
-        return False
-        
-    has_disallowed = any(d in lt for d in disallowed_terms)
-    is_pure_remote = any(r in lt for r in ["remote", "wfh", "work from home"])
-    is_mumbai_pune = any(m in lt for m in ["mumbai", "navi mumbai", "thane", "pune", "hinjewadi", "hinjawadi"])
-    
-    # If explicitly mentions Noida, Gurugram, Delhi/NCR, or Kolkata, strictly block unless 100% remote
-    if any(d in lt for d in ["noida", "gurugram", "gurgaon", "delhi", "ncr", "kolkata"]) and not is_pure_remote:
-        return False
-
-    if has_disallowed and not is_pure_remote and not is_mumbai_pune:
-        return False
-        
-    return True
+    from location_matcher import match_location
+    is_eligible, _, _ = match_location(loc_text, allowed_locations or ["Mumbai", "Pune", "Remote"])
+    return is_eligible
 
 def run_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)", 
                    location: str = "Mumbai, Pune, Qatar, Remote", 
@@ -1849,7 +1784,13 @@ def run_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)",
                                         u = title_elem.get_attribute("href") if title_elem else ""
                                     
                                         if t and c and u:
+                                            jid = card.get_attribute("data-job-id") or card.get_attribute("id") or ""
+                                            if not jid and u:
+                                                m = re.search(r"-?(\d{6,14})(?:\?|$)", u)
+                                                if m:
+                                                    jid = m.group(1)
                                             jobs_to_process.append({
+                                                "id": jid,
                                                 "title": t,
                                                 "company": c,
                                                 "location": l,
@@ -1882,8 +1823,14 @@ def run_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)",
                                     loc_text = job["location"]
                                     exp_text = job["experience"]
                                     job_url = job["url"]
+                                    job_id = job.get("id", "")
+                                    if not job_id and job_url:
+                                        m = re.search(r"-?(\d{6,14})(?:\?|$)", job_url)
+                                        if m:
+                                            job_id = m.group(1)
 
                                     bot_state.current_job = {
+                                        "id": job_id,
                                         "title": title,
                                         "company": company,
                                         "location": loc_text,
@@ -1899,96 +1846,107 @@ def run_agent_sync(search_keyword: str = "All Target Roles (Auto-Cycle)",
                                         bot_state.add_log(f"Skipping Gulf posting for {company} on Naukri India. NaukriGulf engine will process Gulf jobs separately.", "INFO")
                                         continue
 
-                            # STRICT NAUKRI LOCATION FILTER: Only Mumbai, Pune, Remote allowed!
-                            # Blocks Noida, Gurugram, Kolkata, Delhi, Bengaluru, Hyderabad, etc.
-                            if not is_naukri_location_valid(loc_text, naukri_locs_list):
-                                bot_state.add_log(f"📍 Location '{loc_text}' is not allowed for Naukri.com (Allowed: Mumbai, Pune, Remote). Skipping.", "WARNING")
-                                record_application(
-                                    job_title=title,
-                                    company_name=company,
-                                    location=loc_text,
-                                    job_url=job_url,
-                                    status=ApplicationStatus.APPLICATION_SKIPPED,
-                                    match_score=0,
-                                    notes=f"Skipped: Location '{loc_text}' outside candidate target regions (Mumbai, Pune, Remote).",
-                                    failure_reason="LOCATION_NOT_ALLOWED",
-                                    platform="NAUKRI"
-                                )
-                                continue
+                                    # INDEPENDENT ELIGIBILITY CHECK 1: Location Compatibility
+                                    from location_matcher import match_location
+                                    is_loc_valid, matched_locs, extracted_locs = match_location(loc_text, naukri_locs_list)
+                                    if not is_loc_valid:
+                                        bot_state.add_log(f"📍 Location '{loc_text}' does not match candidate preferred locations ({', '.join(naukri_locs_list)}). Skipping.", "WARNING")
+                                        record_application(
+                                            job_title=title,
+                                            company_name=company,
+                                            location=loc_text,
+                                            job_url=job_url,
+                                            status=ApplicationStatus.APPLICATION_SKIPPED,
+                                            match_score=0,
+                                            skip_reason_code="LOCATION_MISMATCH",
+                                            failure_reason="LOCATION_MISMATCH",
+                                            execution_stage="ELIGIBILITY_VERIFICATION",
+                                            detailed_explanation=f"None of the job's listed locations ({', '.join(extracted_locs)}) matches candidate preferred locations ({', '.join(naukri_locs_list)}).",
+                                            notes=f"Skipped: None of the job's listed locations ({loc_text}) match candidate target regions ({', '.join(naukri_locs_list)}).",
+                                            platform="NAUKRI"
+                                        )
+                                        continue
 
-                            # Check blacklisted technology titles (e.g. Java Full Stack, Spring Boot, .NET)
-                            is_title_blocked, title_block_reason = is_job_title_blacklisted(title)
-                            if is_title_blocked:
-                                bot_state.add_log(f"🚫 Skipping unwanted tech role '{title}' @ {company}: {title_block_reason}", "INFO")
-                                record_application(
-                                    job_title=title,
-                                    company_name=company,
-                                    location=loc_text,
-                                    job_url=job_url,
-                                    status=ApplicationStatus.APPLICATION_SKIPPED,
-                                    match_score=0,
-                                    notes=f"Skipped: {title_block_reason}",
-                                    failure_reason="TECHNOLOGY_NOT_ALLOWED",
-                                    platform="NAUKRI"
-                                )
-                                continue
+                                    # INDEPENDENT ELIGIBILITY CHECK 2: Technical Skill Compatibility
+                                    is_title_blocked, title_block_reason, block_reason_code = is_job_title_blacklisted(title, f"Location: {loc_text}, Experience: {exp_text}")
+                                    if is_title_blocked:
+                                        bot_state.add_log(f"🚫 Skipping role '{title}' @ {company}: {title_block_reason}", "INFO")
+                                        record_application(
+                                            job_title=title,
+                                            company_name=company,
+                                            location=loc_text,
+                                            job_url=job_url,
+                                            status=ApplicationStatus.APPLICATION_SKIPPED,
+                                            match_score=0,
+                                            skip_reason_code=block_reason_code or "PRIMARY_SPECIALIZATION_MISMATCH",
+                                            failure_reason=block_reason_code or "PRIMARY_SPECIALIZATION_MISMATCH",
+                                            execution_stage="ELIGIBILITY_VERIFICATION",
+                                            detailed_explanation=f"Technical specialization check: {title_block_reason}",
+                                            notes=f"Skipped: {title_block_reason}",
+                                            platform="NAUKRI"
+                                        )
+                                        continue
 
-                            # Check duplicate in DB
-                            if check_already_applied_db(title, company):
-                                bot_state.add_log(f"Already applied to {title} @ {company} in the past. Skipping.", "INFO")
-                                continue
+                                    # INDEPENDENT ELIGIBILITY CHECK 3: Duplicate Application Status
+                                    if check_already_applied_db(title=title, company=company, job_url=job_url, job_id=job_id):
+                                        bot_state.add_log(f"Already applied or skipped {title} @ {company} in the past. Skipping.", "INFO")
+                                        continue
 
-                            # Check AI relevance
-                            bot_state.status = "EVALUATING"
-                            score, should_apply, reason = evaluate_job_relevance(title, company, f"Location: {loc_text}, Experience: {exp_text}")
-                            bot_state.add_log(f"AI Match Score: {score}% - {reason}", "INFO" if should_apply else "WARNING")
+                                    # INDEPENDENT ELIGIBILITY CHECK 4: Match Score Threshold (score >= 65 is eligible)
+                                    bot_state.status = "EVALUATING"
+                                    score, should_apply, reason = evaluate_job_relevance(title, company, f"Location: {loc_text}, Experience: {exp_text}")
+                                    bot_state.add_log(f"AI Match Score: {score}% - {reason}", "INFO" if score >= 65 else "WARNING")
 
-                            if not should_apply or score < 65:
-                                bot_state.add_log(f"Job does not match profile criteria. Skipping.", "INFO")
-                                record_application(
-                                    job_title=title,
-                                    company_name=company,
-                                    location=loc_text,
-                                    job_url=job_url,
-                                    status=ApplicationStatus.APPLICATION_SKIPPED,
-                                    match_score=score,
-                                    notes=f"AI Skipped: {reason}",
-                                    failure_reason="LOW_MATCH_SCORE",
-                                    experience_req=exp_text
-                                )
-                                continue
+                                    if score < 65:
+                                        bot_state.add_log(f"Job compatibility score ({score}%) is below 65% minimum threshold. Skipping.", "INFO")
+                                        record_application(
+                                            job_title=title,
+                                            company_name=company,
+                                            location=loc_text,
+                                            job_url=job_url,
+                                            status=ApplicationStatus.APPLICATION_SKIPPED,
+                                            match_score=score,
+                                            skip_reason_code="LOW_MATCH_SCORE",
+                                            failure_reason="LOW_MATCH_SCORE",
+                                            execution_stage="ELIGIBILITY_VERIFICATION",
+                                            detailed_explanation=f"The job's compatibility score ({score}%) is below the configured threshold (65%). Reason: {reason}",
+                                            notes=f"AI Skipped: Match score {score}% is below threshold 65%. {reason}",
+                                            experience_req=exp_text,
+                                            platform="NAUKRI"
+                                        )
+                                        continue
 
-                            # Ensure search page is alive
-                            if page is None or page.is_closed():
-                                try:
-                                    page = context.new_page()
-                                except Exception:
-                                    pass
+                                    # Ensure search page is alive
+                                    if page is None or page.is_closed():
+                                        try:
+                                            page = context.new_page()
+                                        except Exception:
+                                            pass
 
-                            # Execute Unified Application Engine (Direct Naukri vs Company Portal)
-                            process_job_application(
-                                context=context,
-                                search_page=page,
-                                title=title,
-                                company=company,
-                                loc_text=loc_text,
-                                exp_text=exp_text,
-                                job_url=job_url,
-                                score=score,
-                                stop_event=bot_state.stop_event
-                            )
+                                    # Execute Unified Application Engine (Direct Naukri vs Company Portal)
+                                    process_job_application(
+                                        context=context,
+                                        search_page=page,
+                                        title=title,
+                                        company=company,
+                                        loc_text=loc_text,
+                                        exp_text=exp_text,
+                                        job_url=job_url,
+                                        score=score,
+                                        stop_event=bot_state.stop_event
+                                    )
 
-                            # Return focus to main search page
-                            try:
-                                if page and not page.is_closed():
-                                    page.bring_to_front()
-                            except Exception:
-                                pass
+                                    # Return focus to main search page
+                                    try:
+                                        if page and not page.is_closed():
+                                            page.bring_to_front()
+                                    except Exception:
+                                        pass
 
-                        bot_state.add_log(f"Finished processing page for role '{role_name}'.", "INFO")
-                        human_sleep(2, 4, bot_state.stop_event)
+                                bot_state.add_log(f"Finished processing page for role '{role_name}'.", "INFO")
+                                human_sleep(2, 4, bot_state.stop_event)
 
-                    bot_state.add_log("🏁 Completed Naukri search cycle.", "SUCCESS")
+                        bot_state.add_log("🏁 Completed Naukri search cycle.", "SUCCESS")
 
                 # --- 2. LINKEDIN SEARCH CYCLE ---
                 if platform_up in ("ALL", "LINKEDIN") and not bot_state.stop_event.is_set():

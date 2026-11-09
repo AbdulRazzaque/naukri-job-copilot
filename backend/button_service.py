@@ -43,7 +43,8 @@ class ButtonDetectionService:
     SUBMIT_TERMS = [
         "submit application", "send application", "complete application",
         "finish application", "submit my application", "submit profile",
-        "confirm and submit", "submit", "apply now"
+        "confirm and submit", "submit", "apply now", "submit cv", "submit resume",
+        "complete and submit", "submit inquiry", "submit form"
     ]
 
     SAVE_TERMS = [
@@ -84,6 +85,9 @@ class ButtonDetectionService:
             if re.search(rf"\b{re.escape(term)}\b", combined, re.IGNORECASE):
                 return ButtonCategory.SUBMIT
 
+        if button_type.lower() == "submit":
+            return ButtonCategory.SUBMIT
+
         # 3. Save
         for term in self.SAVE_TERMS:
             if re.search(rf"\b{re.escape(term)}\b", combined, re.IGNORECASE):
@@ -104,17 +108,27 @@ class ButtonDetectionService:
             if re.search(rf"\b{re.escape(term)}\b", combined, re.IGNORECASE):
                 return ButtonCategory.APPLY
 
-        if button_type.lower() == "submit":
-            return ButtonCategory.SUBMIT
-
         return ButtonCategory.UNRELATED
 
     def detect_buttons_in_container(self, page: Page, container: Optional[Locator] = None) -> List[ButtonMetadata]:
         """
         Discovers and classifies all visible buttons inside a scoped container or page.
         Uses Playwright locators and safe DOM evaluation (no native :has-text).
+        Scans main page and embedded iframes when container is None.
         """
-        root = container if container is not None else page
+        roots = []
+        if container is not None:
+            roots = [container]
+        else:
+            roots = [page]
+            try:
+                frames = getattr(page, 'frames', [])
+                for f in frames:
+                    if f != getattr(page, 'main_frame', None):
+                        roots.append(f)
+            except Exception:
+                pass
+
         detected: List[ButtonMetadata] = []
 
         candidate_selectors = [
@@ -135,48 +149,49 @@ class ButtonDetectionService:
 
         seen_elements = set()
 
-        for sel in candidate_selectors:
-            try:
-                loc = root.locator(sel)
-                count = loc.count()
-                for i in range(count):
-                    btn = loc.nth(i)
-                    try:
-                        if not btn.is_visible():
+        for root in roots:
+            for sel in candidate_selectors:
+                try:
+                    loc = root.locator(sel)
+                    count = loc.count()
+                    for i in range(count):
+                        btn = loc.nth(i)
+                        try:
+                            if not btn.is_visible():
+                                continue
+
+                            meta = btn.evaluate("""(el) => {
+                                const text = (el.innerText || el.textContent || el.value || '').trim();
+                                const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+                                const btype = (el.getAttribute('type') || '').trim();
+                                return { text: text, aria: aria, btype: btype, disabled: el.disabled || el.getAttribute('aria-disabled') === 'true' };
+                            }""")
+
+                            text = meta.get("text", "")
+                            aria = meta.get("aria", "")
+                            btype = meta.get("btype", "")
+                            is_disabled = meta.get("disabled", False)
+                            is_enabled = not is_disabled and btn.is_enabled()
+
+                            key = f"{text}_{aria}_{btype}_{sel}"
+                            if key in seen_elements:
+                                continue
+                            seen_elements.add(key)
+
+                            category = self.classify_button_text(text, aria, btype)
+                            if category != ButtonCategory.UNRELATED:
+                                detected.append(ButtonMetadata(
+                                    locator=btn,
+                                    text=text or aria or "Button",
+                                    category=category,
+                                    is_enabled=is_enabled,
+                                    is_visible=True,
+                                    selector=sel
+                                ))
+                        except Exception:
                             continue
-
-                        meta = btn.evaluate("""(el) => {
-                            const text = (el.innerText || el.textContent || el.value || '').trim();
-                            const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
-                            const btype = (el.getAttribute('type') || '').trim();
-                            return { text: text, aria: aria, btype: btype, disabled: el.disabled || el.getAttribute('aria-disabled') === 'true' };
-                        }""")
-
-                        text = meta.get("text", "")
-                        aria = meta.get("aria", "")
-                        btype = meta.get("btype", "")
-                        is_disabled = meta.get("disabled", False)
-                        is_enabled = not is_disabled and btn.is_enabled()
-
-                        key = f"{text}_{aria}_{btype}_{sel}"
-                        if key in seen_elements:
-                            continue
-                        seen_elements.add(key)
-
-                        category = self.classify_button_text(text, aria, btype)
-                        if category != ButtonCategory.UNRELATED:
-                            detected.append(ButtonMetadata(
-                                locator=btn,
-                                text=text or aria or "Button",
-                                category=category,
-                                is_enabled=is_enabled,
-                                is_visible=True,
-                                selector=sel
-                            ))
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+                except Exception:
+                    continue
 
         return detected
 
@@ -330,7 +345,9 @@ def is_naukri_application_confirmed(page: Page) -> Tuple[bool, str]:
             const successTerms = [
                 'applied successfully', 'successfully applied', 'application has been sent',
                 'application received', 'thank you for applying', 'already applied',
-                'applied to', 'applied on', 'application submitted', 'profile sent', 'resume sent'
+                'applied to', 'applied on', 'application submitted', 'profile sent', 'resume sent',
+                'we received your application', 'we have received your application', 'received your application',
+                'will contact you shortly'
             ];
             for (const t of toastEls) {
                 const txt = (t.innerText || '').toLowerCase();

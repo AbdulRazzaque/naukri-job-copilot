@@ -5,15 +5,23 @@ import {
   Play, Square, Shield, Clock, CheckCircle2, ExternalLink, 
   AlertTriangle, RefreshCw, Terminal, User, Briefcase, 
   MapPin, DollarSign, Database, Globe, Sparkles, ChevronRight,
-  Filter, Search, ArrowUpRight
+  Filter, Search, ArrowUpRight, Info, FileText, CheckCircle, XCircle,
+  PlayCircle, FileCheck, AlertCircle, Calendar, Copy, Check, 
+  ArrowDown, X, Trash2, ListFilter, SlidersHorizontal
 } from 'lucide-react';
 
 export default function Dashboard() {
   const [stats, setStats] = useState({
     total_applied: 0,
     today_applied: 0,
-    daily_safe_limit: 45,
-    remaining_today: 45,
+    daily_safe_limit: 135,
+    remaining_today: 135,
+    today_naukri: 0,
+    today_linkedin: 0,
+    today_naukrigulf: 0,
+    naukri_applied: 0,
+    linkedin_applied: 0,
+    naukrigulf_applied: 0,
     external_redirects: 0,
     failed_attempts: 0,
     needs_user_input: 0
@@ -24,7 +32,7 @@ export default function Dashboard() {
     status: 'IDLE',
     countdown_remaining: 0,
     today_applied: 0,
-    daily_limit: 45,
+    daily_limit: 135,
     current_job: {},
     recent_logs: []
   });
@@ -33,6 +41,20 @@ export default function Dashboard() {
   const [applications, setApplications] = useState([]);
   const [activeTab, setActiveTab] = useState('ALL');
   const [searchTerm, setSearchTerm] = useState('');
+  const [dateFilter, setDateFilter] = useState('ALL'); // 'ALL' | 'TODAY' | 'YESTERDAY' | 'WEEK'
+  const [platformFilter, setPlatformFilter] = useState('ALL'); // 'ALL' | 'NAUKRI' | 'LINKEDIN' | 'NAUKRIGULF'
+  
+  // Live Activity Stream State
+  const [logLevelFilter, setLogLevelFilter] = useState('ALL'); // 'ALL' | 'SUCCESS' | 'WARNING' | 'ERROR' | 'INFO'
+  const [logSearchTerm, setLogSearchTerm] = useState('');
+  const [logAutoScroll, setLogAutoScroll] = useState(true);
+  const [logCopied, setLogCopied] = useState(false);
+  const [logsPaused, setLogsPaused] = useState(false);
+  const logsContainerRef = useRef(null);
+
+  const [auditModal, setAuditModal] = useState(null);
+  const [reportData, setReportData] = useState(null);
+  const [loadingReport, setLoadingReport] = useState(false);
   
   // Controls Form
   const [keyword, setKeyword] = useState('All Target Roles (Auto-Cycle)');
@@ -42,7 +64,6 @@ export default function Dashboard() {
   const [naukrigulfLocations, setNaukrigulfLocations] = useState('Qatar, Dubai, UAE, Saudi Arabia, Remote');
   const [experience, setExperience] = useState(5);
   const [platform, setPlatform] = useState('ALL'); // 'ALL' | 'NAUKRI' | 'LINKEDIN' | 'NAUKRIGULF'
-  const [platformFilter, setPlatformFilter] = useState('ALL'); // 'ALL' | 'NAUKRI' | 'LINKEDIN' | 'NAUKRIGULF'
   const [loadingAction, setLoadingAction] = useState(false);
   const [profileModal, setProfileModal] = useState(false);
   const [profileData, setProfileData] = useState(null);
@@ -51,6 +72,21 @@ export default function Dashboard() {
   const [configModal, setConfigModal] = useState(false);
   const [agentConfig, setAgentConfig] = useState(null);
   const [savingConfig, setSavingConfig] = useState(false);
+
+  // Check if daily quota is exceeded based on selected platform or overall limit (135)
+  const isQuotaExceeded = () => {
+    if (platform === 'NAUKRI') {
+      return (stats.today_naukri || 0) >= (stats.quota_naukri || 45);
+    }
+    if (platform === 'LINKEDIN') {
+      return (stats.today_linkedin || 0) >= (stats.quota_linkedin || 45);
+    }
+    if (platform === 'NAUKRIGULF') {
+      return (stats.today_naukrigulf || 0) >= (stats.quota_naukrigulf || 45);
+    }
+    // For 'ALL' platforms, check total limit across all platforms (135 safe quota)
+    return (stats.today_applied || 0) >= (stats.daily_safe_limit || 135);
+  };
 
   // Poll status & stats every 2 seconds
   useEffect(() => {
@@ -144,6 +180,21 @@ export default function Dashboard() {
     }
   };
 
+  const loadReport = async (appId) => {
+    try {
+      setLoadingReport(true);
+      const res = await fetch(`/api/application/${appId}/report`);
+      if (res.ok) {
+        const data = await res.json();
+        setReportData(data);
+      }
+    } catch (e) {
+      console.error("Error loading report:", e);
+    } finally {
+      setLoadingReport(false);
+    }
+  };
+
   const fetchChromeStatus = async () => {
     try {
       const res = await fetch('/api/check-chrome');
@@ -209,27 +260,135 @@ export default function Dashboard() {
     }
   };
 
+  // Date Helpers
+  const parseAppDate = (dateStr) => {
+    if (!dateStr) return null;
+    const clean = String(dateStr).includes('T') ? String(dateStr) : String(dateStr).replace(' ', 'T');
+    const d = new Date(clean);
+    return isNaN(d.getTime()) ? null : d;
+  };
+
+  const isTodayDate = (d) => {
+    if (!d) return false;
+    const now = new Date();
+    return d.getFullYear() === now.getFullYear() &&
+           d.getMonth() === now.getMonth() &&
+           d.getDate() === now.getDate();
+  };
+
+  const isYesterdayDate = (d) => {
+    if (!d) return false;
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    return d.getFullYear() === yesterday.getFullYear() &&
+           d.getMonth() === yesterday.getMonth() &&
+           d.getDate() === yesterday.getDate();
+  };
+
+  const isWithinDays = (d, days) => {
+    if (!d) return false;
+    const now = new Date();
+    const past = new Date();
+    past.setDate(past.getDate() - days);
+    return d >= past && d <= now;
+  };
+
+  const formatAppliedDate = (dateStr) => {
+    const d = parseAppDate(dateStr);
+    if (!d) return { label: 'Just now', isToday: true, isYesterday: false, time: '', full: '' };
+    const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const fullStr = d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + ' at ' + timeStr;
+    if (isTodayDate(d)) {
+      return { label: 'Today', isToday: true, isYesterday: false, time: timeStr, full: fullStr };
+    }
+    if (isYesterdayDate(d)) {
+      return { label: 'Yesterday', isToday: false, isYesterday: true, time: timeStr, full: fullStr };
+    }
+    const dateLabel = d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+    return { label: dateLabel, isToday: false, isYesterday: false, time: timeStr, full: fullStr };
+  };
+
+  // Quick stats counts
+  const todayAppsCount = applications.filter(a => isTodayDate(parseAppDate(a.applied_at))).length;
+  const yesterdayAppsCount = applications.filter(a => isYesterdayDate(parseAppDate(a.applied_at))).length;
+
   // Filtered applications
   const filteredApps = applications.filter(app => {
-    const matchesSearch = 
-      app.job_title?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      app.company_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (app.location && app.location.toLowerCase().includes(searchTerm.toLowerCase()));
+    // 1. Text Search Filter (Title, Company, Location, Skip Reason, Notes)
+    if (searchTerm.trim()) {
+      const term = searchTerm.toLowerCase().trim();
+      const matchesSearch = 
+        app.job_title?.toLowerCase().includes(term) ||
+        app.company_name?.toLowerCase().includes(term) ||
+        (app.location && app.location.toLowerCase().includes(term)) ||
+        (app.skip_reason_code && app.skip_reason_code.toLowerCase().includes(term)) ||
+        (app.detailed_explanation && app.detailed_explanation.toLowerCase().includes(term)) ||
+        (app.notes && app.notes.toLowerCase().includes(term));
+      if (!matchesSearch) return false;
+    }
 
-    if (!matchesSearch) return false;
+    // 2. Date Filter
+    if (dateFilter !== 'ALL') {
+      const d = parseAppDate(app.applied_at);
+      if (dateFilter === 'TODAY' && !isTodayDate(d)) return false;
+      if (dateFilter === 'YESTERDAY' && !isYesterdayDate(d)) return false;
+      if (dateFilter === 'WEEK' && !isWithinDays(d, 7)) return false;
+    }
 
-    // Platform filter
+    // 3. Platform filter
     const appPlatform = (app.platform || 'NAUKRI').toUpperCase();
     if (platformFilter !== 'ALL' && appPlatform !== platformFilter) return false;
 
+    // 4. Tab Status Filter
     if (activeTab === 'ALL') return true;
-    if (activeTab === 'APPLIED') return app.status === 'APPLIED' || app.status === 'APPLICATION_CONFIRMED';
-    if (activeTab === 'REDIRECT_REVIEW') return app.status === 'REDIRECT_REVIEW' || app.status === 'APPLICATION_PENDING_CONFIRMATION';
-    if (activeTab === 'NEEDS_USER_INPUT') return app.status === 'NEEDS_USER_INPUT';
-    if (activeTab === 'SKIPPED') return app.status === 'SKIPPED' || app.status === 'APPLICATION_SKIPPED';
-    if (activeTab === 'FAILED') return app.status === 'FAILED' || app.status === 'APPLICATION_FAILED';
+    const st = (app.status || '').toUpperCase();
+    if (activeTab === 'APPLIED') {
+      return (
+        st === 'APPLIED' ||
+        st === 'ALREADY_APPLIED' ||
+        st === 'APPLICATION_CONFIRMED' ||
+        ((st === 'SUBMITTED_PENDING_CONFIRMATION' || st === 'APPLICATION_PENDING_CONFIRMATION' || st === 'REDIRECT_REVIEW') && (app.application_submitted || app.applicationSubmitted))
+      );
+    }
+    if (activeTab === 'REDIRECT_REVIEW' || activeTab === 'PENDING') {
+      return (
+        (st === 'SUBMITTED_PENDING_CONFIRMATION' || st === 'APPLICATION_PENDING_CONFIRMATION' || st === 'REDIRECT_REVIEW') &&
+        !(app.application_submitted || app.applicationSubmitted)
+      );
+    }
+    if (activeTab === 'NEEDS_USER_INPUT' || activeTab === 'NEEDS_INPUT') {
+      return st === 'NEEDS_INPUT' || st === 'NEEDS_USER_INPUT' || st === 'NEEDS_USER_ACTION';
+    }
+    if (activeTab === 'SKIPPED') return st === 'SKIPPED' || st === 'APPLICATION_SKIPPED';
+    if (activeTab === 'FAILED') return st === 'FAILED' || st === 'APPLICATION_FAILED' || st === 'APPLICATION_BLOCKED';
     return true;
   });
+
+  // Filtered Live Activity Logs
+  const filteredLogs = (botState.recent_logs || []).filter(log => {
+    if (logLevelFilter !== 'ALL' && (log.level || 'INFO').toUpperCase() !== logLevelFilter) {
+      return false;
+    }
+    if (logSearchTerm.trim()) {
+      const st = logSearchTerm.toLowerCase();
+      return (log.message || '').toLowerCase().includes(st) || (log.level || '').toLowerCase().includes(st);
+    }
+    return true;
+  });
+
+  // Auto-scroll effect for terminal
+  useEffect(() => {
+    if (logAutoScroll && !logsPaused && logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+    }
+  }, [botState.recent_logs, logAutoScroll, logsPaused]);
+
+  const handleCopyLogs = () => {
+    const text = filteredLogs.map(l => `[${l.timestamp}] [${l.level}] ${l.message}`).join('\n');
+    navigator.clipboard.writeText(text);
+    setLogCopied(true);
+    setTimeout(() => setLogCopied(false), 2000);
+  };
 
   const formatCountdown = (secs) => {
     const m = Math.floor(secs / 60);
@@ -661,7 +820,7 @@ export default function Dashboard() {
                   <Shield className="w-3.5 h-3.5" />
                   <span>Enforced Safety Settings:</span>
                 </div>
-                <p>• Max 45 applications/day strictly capped.</p>
+                <p>• Max 45 applications/day per platform (135 total safe quota).</p>
                 <p>• Mandatory 2-3 minute pause after each application.</p>
                 <p>• Human mouse wheel & jitter scrolling enabled.</p>
               </div>
@@ -671,17 +830,20 @@ export default function Dashboard() {
                 {!botState.is_running ? (
                   <button 
                     onClick={handleStart}
-                    disabled={loadingAction || stats.today_applied >= 45}
-                    className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-600 hover:to-emerald-600 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-teal-500/20 transition disabled:opacity-50"
+                    disabled={loadingAction || isQuotaExceeded()}
+                    className="flex-1 py-3 px-4 rounded-xl bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-600 hover:to-emerald-600 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-teal-500/20 transition disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
                   >
                     <Play className="w-4 h-4 fill-current" />
-                    Start Safe Auto-Apply
+                    {isQuotaExceeded() 
+                      ? `Quota Reached (${platform === 'ALL' ? `${stats.today_applied || 0}/${stats.daily_safe_limit || 135}` : `${platform === 'NAUKRI' ? stats.today_naukri : platform === 'LINKEDIN' ? stats.today_linkedin : stats.today_naukrigulf || 0}/45`})`
+                      : 'Start Safe Auto-Apply'
+                    }
                   </button>
                 ) : (
                   <button 
                     onClick={handleStop}
                     disabled={loadingAction}
-                    className="flex-1 py-3 px-4 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 font-bold text-sm flex items-center justify-center gap-2 transition"
+                    className="flex-1 py-3 px-4 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 font-bold text-sm flex items-center justify-center gap-2 transition cursor-pointer"
                   >
                     <Square className="w-4 h-4 fill-current" />
                     Pause Agent
@@ -798,19 +960,19 @@ export default function Dashboard() {
                 onClick={() => setActiveTab('APPLIED')}
                 className={`px-3 py-1.5 rounded-lg transition font-medium ${activeTab === 'APPLIED' ? 'bg-teal-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'}`}
               >
-                ✅ Applied ({stats.total_applied})
+                ✅ Successfully Applied ({stats.total_applied})
               </button>
               <button
                 onClick={() => setActiveTab('REDIRECT_REVIEW')}
                 className={`px-3 py-1.5 rounded-lg transition font-medium ${activeTab === 'REDIRECT_REVIEW' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'}`}
               >
-                ⭐ External Review ({stats.external_redirects})
+                ⏳ Submission Pending ({stats.external_redirects})
               </button>
               <button
                 onClick={() => setActiveTab('NEEDS_USER_INPUT')}
                 className={`px-3 py-1.5 rounded-lg transition font-medium ${activeTab === 'NEEDS_USER_INPUT' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'}`}
               >
-                ❓ Needs Input ({stats.needs_user_input || 0})
+                ❓ Requires Action ({stats.needs_user_input || 0})
               </button>
               <button
                 onClick={() => setActiveTab('FAILED')}
@@ -822,7 +984,7 @@ export default function Dashboard() {
                 onClick={() => setActiveTab('SKIPPED')}
                 className={`px-3 py-1.5 rounded-lg transition font-medium ${activeTab === 'SKIPPED' ? 'bg-slate-700 text-white font-bold' : 'text-slate-400 hover:text-white'}`}
               >
-                Skipped
+                ⏭️ Skipped
               </button>
             </div>
 
@@ -882,6 +1044,9 @@ export default function Dashboard() {
                         {app.experience_req && (
                           <span className="block text-[10px] text-slate-400 font-normal">Exp: {app.experience_req}</span>
                         )}
+                        {app.customized_resume_path && (
+                          <span className="block text-[10px] text-emerald-400 font-mono mt-0.5">📄 Tailored CV Attached</span>
+                        )}
                       </td>
                       <td className="py-3 px-4 text-slate-300 font-medium">{app.company_name}</td>
                       <td className="py-3 px-4">
@@ -902,42 +1067,104 @@ export default function Dashboard() {
                           {app.match_score || 85}%
                         </span>
                       </td>
-                      <td className="py-3 px-4">
+                      <td className="py-3 px-4 max-w-xs">
                         {(app.status === 'APPLIED' || app.status === 'APPLICATION_CONFIRMED') && (
-                          <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 inline-flex items-center gap-1">
-                            <CheckCircle2 className="w-3 h-3" /> Direct Applied
-                          </span>
+                          <div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 inline-flex items-center gap-1">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-400" /> Successfully Applied
+                            </span>
+                            <span className="block text-[10px] text-emerald-400/90 font-mono mt-0.5 max-w-[200px] truncate" title={app.confirmation_message || app.confirmationMessage || app.notes || 'Verified Submission'}>
+                              {app.confirmation_type || app.confirmationType ? `Evidence: ${app.confirmation_type || app.confirmationType}` : (app.notes || 'Submission Confirmed')}
+                            </span>
+                          </div>
                         )}
-                        {(app.status === 'REDIRECT_REVIEW' || app.status === 'APPLICATION_PENDING_CONFIRMATION') && (
-                          <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20 inline-flex items-center gap-1">
-                            <ExternalLink className="w-3 h-3" /> External Site
-                          </span>
+                        {app.status === 'ALREADY_APPLIED' && (
+                          <div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 inline-flex items-center gap-1">
+                              <CheckCircle2 className="w-3 h-3 text-blue-400" /> Already Applied
+                            </span>
+                            <span className="block text-[10px] text-blue-400/80 font-mono mt-0.5 max-w-[200px] truncate" title={app.confirmation_message || app.confirmationMessage || app.detailed_explanation || 'Candidate previously applied'}>
+                              {app.confirmation_message || app.confirmationMessage || 'Application under review'}
+                            </span>
+                          </div>
                         )}
-                        {app.status === 'NEEDS_USER_INPUT' && (
+                        {(app.status === 'SUBMITTED_PENDING_CONFIRMATION' || app.status === 'APPLICATION_PENDING_CONFIRMATION' || app.status === 'REDIRECT_REVIEW') && (
                           <div>
                             <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20 inline-flex items-center gap-1">
-                              <AlertTriangle className="w-3 h-3 text-amber-400" /> Needs Input
+                              <Clock className="w-3 h-3 text-amber-400" /> Submission Verification Pending
                             </span>
-                            {app.failure_reason && (
-                              <span className="block text-[10px] text-amber-400/80 mt-0.5 max-w-[140px] truncate" title={app.failure_reason}>
-                                {app.failure_reason}
-                              </span>
-                            )}
+                            <span className="block text-[10px] text-amber-400/90 mt-0.5 max-w-[200px] truncate" title={app.detailed_explanation || app.detailedExplanation || app.notes || 'Submit clicked, awaiting verified confirmation'}>
+                              {app.detailed_explanation || app.detailedExplanation || app.notes || 'Awaiting verified confirmation evidence'}
+                            </span>
+                          </div>
+                        )}
+                        {(app.status === 'NEEDS_INPUT' || app.status === 'NEEDS_USER_INPUT' || app.status === 'NEEDS_USER_ACTION') && (
+                          <div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30 inline-flex items-center gap-1">
+                              <AlertTriangle className="w-3 h-3 text-amber-400" /> Requires Your Action
+                            </span>
+                            <span className="block text-[10px] text-amber-300/90 font-medium mt-0.5 max-w-[220px] truncate" title={app.detailed_explanation || app.detailedExplanation || app.notes || app.failure_reason}>
+                              {app.detailed_explanation || app.detailedExplanation || app.notes || app.failure_reason || 'Requires user intervention in browser'}
+                            </span>
+                          </div>
+                        )}
+                        {app.status === 'APPLYING' && (
+                          <div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 inline-flex items-center gap-1">
+                              <PlayCircle className="w-3 h-3 text-indigo-400" /> Application In Progress
+                            </span>
+                            <span className="block text-[10px] text-slate-500 font-mono mt-0.5">
+                              Stage: {app.execution_stage || app.executionStage || 'FORM_IN_PROGRESS'}
+                            </span>
+                          </div>
+                        )}
+                        {app.status === 'FORM_COMPLETED' && (
+                          <div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 inline-flex items-center gap-1">
+                              <FileCheck className="w-3 h-3 text-cyan-400" /> Form Completed
+                            </span>
+                            <span className="block text-[10px] text-cyan-400/80 font-mono mt-0.5">
+                              Ready for submission verification
+                            </span>
                           </div>
                         )}
                         {(app.status === 'SKIPPED' || app.status === 'APPLICATION_SKIPPED') && (
-                          <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-slate-800 text-slate-400 inline-flex items-center gap-1">
-                            Skipped
-                          </span>
-                        )}
-                        {(app.status === 'FAILED' || app.status === 'APPLICATION_FAILED') && (
                           <div>
-                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">
-                              Failed
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400 border border-slate-700 inline-flex items-center gap-1">
+                                ⏭️ Skipped
+                              </span>
+                              {(app.skip_reason_code || app.skipReasonCode) && (
+                                <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold ${
+                                  (app.skip_reason_code || app.skipReasonCode) === 'LOCATION_MISMATCH' ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30' :
+                                  (app.skip_reason_code || app.skipReasonCode) === 'LOCATION_NOT_FOUND' ? 'bg-yellow-500/15 text-yellow-300 border border-yellow-500/30' :
+                                  (app.skip_reason_code || app.skipReasonCode) === 'PRIMARY_SPECIALIZATION_MISMATCH' ? 'bg-purple-500/15 text-purple-300 border border-purple-500/30' :
+                                  (app.skip_reason_code || app.skipReasonCode) === 'REQUIRED_SKILL_MISSING' ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30' :
+                                  (app.skip_reason_code || app.skipReasonCode) === 'ALREADY_APPLIED' ? 'bg-blue-500/15 text-blue-300 border border-blue-500/30' :
+                                  (app.skip_reason_code || app.skipReasonCode) === 'APPLY_OPTION_NOT_AVAILABLE' ? 'bg-orange-500/15 text-orange-300 border border-orange-500/30' :
+                                  (app.skip_reason_code || app.skipReasonCode) === 'LOW_MATCH_SCORE' ? 'bg-slate-700 text-slate-300 border border-slate-600' :
+                                  'bg-slate-800 text-slate-300 border border-slate-700'
+                                }`}>
+                                  {app.skip_reason_code || app.skipReasonCode}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[10px] text-slate-400 mt-1 max-w-[220px] line-clamp-2 leading-tight" title={app.detailed_explanation || app.detailedExplanation || app.notes}>
+                              {app.detailed_explanation || app.detailedExplanation || app.notes}
+                            </p>
+                          </div>
+                        )}
+                        {(app.status === 'FAILED' || app.status === 'APPLICATION_FAILED' || app.status === 'APPLICATION_BLOCKED') && (
+                          <div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20 inline-flex items-center gap-1">
+                              <AlertCircle className="w-3 h-3 text-rose-400" /> Application Failed
                             </span>
-                            {app.failure_reason && (
-                              <span className="block text-[10px] text-rose-400/80 mt-0.5 max-w-[140px] truncate" title={app.failure_reason}>
-                                {app.failure_reason}
+                            <span className="block text-[10px] text-slate-500 font-mono mt-0.5">
+                              Stage: {app.execution_stage || app.executionStage || 'APPLICATION_EXECUTION'}
+                            </span>
+                            {(app.error_message || app.errorMessage || app.failure_reason) && (
+                              <span className="block text-[10px] text-rose-400/90 font-mono mt-0.5 max-w-[200px] truncate" title={app.error_message || app.errorMessage || app.failure_reason}>
+                                {app.error_message || app.errorMessage || app.failure_reason}
                               </span>
                             )}
                           </div>
@@ -947,19 +1174,32 @@ export default function Dashboard() {
                         {app.applied_at ? new Date(app.applied_at).toLocaleString() : 'Just now'}
                       </td>
                       <td className="py-3 px-4 text-right">
-                        {app.job_url ? (
-                          <a 
-                            href={app.job_url} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 text-teal-400 hover:text-teal-300 font-medium transition"
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => {
+                              setAuditModal(app);
+                              setReportData(null);
+                            }}
+                            className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] font-medium border border-slate-700/60 transition inline-flex items-center gap-1"
+                            title="Inspect application audit details"
                           >
-                            <span>Open</span>
-                            <ArrowUpRight className="w-3.5 h-3.5" />
-                          </a>
-                        ) : (
-                          <span className="text-slate-600">-</span>
-                        )}
+                            <Info className="w-3 h-3 text-teal-400" />
+                            <span>Audit</span>
+                          </button>
+                          {app.job_url ? (
+                            <a 
+                              href={app.job_url} 
+                              target="_blank" 
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-teal-400 hover:text-teal-300 font-medium transition text-xs"
+                            >
+                              <span>Open</span>
+                              <ArrowUpRight className="w-3.5 h-3.5" />
+                            </a>
+                          ) : (
+                            <span className="text-slate-600">-</span>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))
@@ -975,6 +1215,248 @@ export default function Dashboard() {
           </div>
         </div>
       </main>
+
+      {/* Application Audit & Decision Details Modal */}
+      {auditModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="glass-card max-w-2xl w-full p-6 rounded-2xl space-y-4 max-h-[90vh] overflow-y-auto border border-slate-700/80 shadow-2xl">
+            {/* Modal Header */}
+            <div className="flex items-start justify-between pb-3 border-b border-slate-800">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  {(auditModal.platform || 'NAUKRI').toUpperCase() === 'LINKEDIN' ? (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-500/15 text-blue-400 border border-blue-500/30 inline-flex items-center gap-1">
+                      <span>🟦</span> LinkedIn
+                    </span>
+                  ) : (auditModal.platform || '').toUpperCase() === 'NAUKRIGULF' ? (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 inline-flex items-center gap-1">
+                      <span>🌐</span> NaukriGulf
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 inline-flex items-center gap-1">
+                      <span>🔷</span> Naukri.com
+                    </span>
+                  )}
+                  <span className="text-xs text-slate-400 font-mono">ID #{auditModal.id || auditModal.jobId}</span>
+                </div>
+                <h3 className="font-bold text-white text-lg leading-snug">{auditModal.job_title || auditModal.jobTitle}</h3>
+                <p className="text-sm text-slate-300 font-medium">{auditModal.company_name || auditModal.companyName} • 📍 {auditModal.location || auditModal.jobLocation || 'Mumbai / Remote'}</p>
+              </div>
+              <button 
+                onClick={() => {
+                  setAuditModal(null);
+                  setReportData(null);
+                }}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Status & Verification Badges */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+              <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                <span className="text-[10px] text-slate-400 block uppercase tracking-wider font-semibold">Status</span>
+                <span className="text-xs font-bold text-white mt-1 block truncate">
+                  {auditModal.status || auditModal.applicationStatus}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                <span className="text-[10px] text-slate-400 block uppercase tracking-wider font-semibold">AI Match Score</span>
+                <span className="text-xs font-bold text-teal-400 mt-1 block">
+                  {auditModal.match_score || auditModal.matchScore || 85}%
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                <span className="text-[10px] text-slate-400 block uppercase tracking-wider font-semibold">Resume Upload</span>
+                <span className={`text-xs font-bold mt-1 block ${
+                  (auditModal.resume_upload_status || auditModal.resumeUploadStatus) === 'UPLOADED' ? 'text-emerald-400' :
+                  (auditModal.resume_upload_status || auditModal.resumeUploadStatus) === 'FAILED' ? 'text-rose-400' : 'text-slate-400'
+                }`}>
+                  {auditModal.resume_upload_status || auditModal.resumeUploadStatus || 'NOT_STARTED'}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                <span className="text-[10px] text-slate-400 block uppercase tracking-wider font-semibold">Attempted</span>
+                <span className={`text-xs font-bold mt-1 inline-flex items-center gap-1 ${
+                  (auditModal.application_attempted ?? auditModal.applicationAttempted) ? 'text-emerald-400' : 'text-slate-500'
+                }`}>
+                  {(auditModal.application_attempted ?? auditModal.applicationAttempted) ? <CheckCircle className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                  {(auditModal.application_attempted ?? auditModal.applicationAttempted) ? 'Yes' : 'No'}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                <span className="text-[10px] text-slate-400 block uppercase tracking-wider font-semibold">Confirmed</span>
+                <span className={`text-xs font-bold mt-1 inline-flex items-center gap-1 ${
+                  (auditModal.application_confirmed ?? auditModal.applicationConfirmed) ? 'text-emerald-400' : 'text-slate-500'
+                }`}>
+                  {(auditModal.application_confirmed ?? auditModal.applicationConfirmed) ? <CheckCircle className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                  {(auditModal.application_confirmed ?? auditModal.applicationConfirmed) ? 'Yes' : 'No'}
+                </span>
+              </div>
+            </div>
+
+            {/* Execution Stage Tracker */}
+            <div className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2">
+              <span className="text-[11px] font-semibold text-slate-400 block uppercase tracking-wider">
+                Execution Stage Pipeline {(auditModal.external_application_url || auditModal.externalApplicationUrl) ? '(External Company Portal)' : ''}
+              </span>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {((auditModal.external_application_url || auditModal.externalApplicationUrl || (auditModal.apply_type || '').includes('COMPANY')) ? [
+                  { key: 'EXTERNAL_APPLY_DETECTED', label: '1. Detected' },
+                  { key: 'EXTERNAL_PAGE_OPENED', label: '2. Page Opened' },
+                  { key: 'EXTERNAL_JOB_VERIFIED', label: '3. Job Verified' },
+                  { key: 'APPLICATION_FORM_DETECTED', label: '4. Form Found' },
+                  { key: 'FORM_FILLING_STARTED', label: '5. Form Filled' },
+                  { key: 'RESUME_UPLOAD_COMPLETED', label: '6. CV Attached' },
+                  { key: 'FORM_VALIDATED', label: '7. Validated' },
+                  { key: 'APPLICATION_SUBMITTED', label: '8. Submitted' },
+                  { key: 'APPLICATION_CONFIRMED', label: '9. Confirmed' }
+                ] : [
+                  { key: 'DISCOVERED', label: '1. Discovered' },
+                  { key: 'ELIGIBILITY_VERIFICATION', label: '2. Eligibility' },
+                  { key: 'ACTION_BUTTON_DETECTION', label: '3. Button Detect' },
+                  { key: 'RESUME_TAILORING', label: '4. CV Tailoring' },
+                  { key: 'FORM_AUTOFILL', label: '5. Form Autofill' },
+                  { key: 'SUBMISSION_VERIFICATION', label: '6. Verified Submit' }
+                ]).map(stage => {
+                  const current = (auditModal.execution_stage || auditModal.executionStage || '').toUpperCase();
+                  const isCurrent = current === stage.key;
+                  return (
+                    <span 
+                      key={stage.key}
+                      className={`px-2 py-1 rounded-md text-[10px] font-mono font-medium transition ${
+                        isCurrent 
+                          ? 'bg-teal-500 text-slate-950 font-bold ring-2 ring-teal-400/50' 
+                          : 'bg-slate-800/80 text-slate-400 border border-slate-700/50'
+                      }`}
+                    >
+                      {stage.label}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Skip Decision Details (Mandatory Requirement) */}
+            {((auditModal.status || '').includes('SKIPPED') || auditModal.skip_reason_code || auditModal.skipReasonCode) && (
+              <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                    <Shield className="w-4 h-4 text-amber-400" />
+                    Skip Decision & Standardized Reason Code
+                  </span>
+                  <span className="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40">
+                    {auditModal.skip_reason_code || auditModal.skipReasonCode || 'APPLY_OPTION_NOT_AVAILABLE'}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed bg-slate-950/60 p-3 rounded-lg border border-slate-800/80">
+                  {auditModal.detailed_explanation || auditModal.detailedExplanation || auditModal.notes || 'No further explanation recorded.'}
+                </p>
+              </div>
+            )}
+
+            {/* Failure Diagnostics Details */}
+            {((auditModal.status || '').includes('FAILED') || auditModal.error_message || auditModal.errorMessage) && (
+              <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-rose-300 flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4 text-rose-400" />
+                    Failure Stage & Diagnostics
+                  </span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-200 border border-rose-500/40">
+                    Stage: {auditModal.execution_stage || auditModal.executionStage || 'APPLICATION_EXECUTION'}
+                  </span>
+                </div>
+                <div className="text-xs text-rose-300 font-mono bg-slate-950/80 p-3 rounded-lg border border-rose-900/40 overflow-x-auto whitespace-pre-wrap">
+                  {auditModal.error_message || auditModal.errorMessage || auditModal.failure_reason || 'Unknown technical failure'}
+                </div>
+              </div>
+            )}
+
+            {/* Screenshot Reference if any */}
+            {(auditModal.screenshot_reference || auditModal.screenshotReference) && (
+              <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between text-xs">
+                <span className="text-slate-400 font-mono">📸 Screenshot Captured:</span>
+                <span className="text-teal-400 font-mono text-[11px] truncate max-w-sm">
+                  {auditModal.screenshot_reference || auditModal.screenshotReference}
+                </span>
+              </div>
+            )}
+
+            {/* CV Tailoring Details */}
+            {auditModal.customized_resume_path && (
+              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-between text-xs">
+                <span className="text-emerald-300 font-semibold flex items-center gap-1.5">
+                  <FileText className="w-4 h-4 text-emerald-400" /> Tailored PDF CV Generated:
+                </span>
+                <span className="text-white font-mono text-[11px] truncate max-w-xs">
+                  {auditModal.customized_resume_path.split('\\').pop() || auditModal.customized_resume_path.split('/').pop()}
+                </span>
+              </div>
+            )}
+
+            {/* Full Report Viewer Button */}
+            <div className="pt-1">
+              {!reportData ? (
+                <button
+                  onClick={() => loadReport(auditModal.id || auditModal.jobId)}
+                  disabled={loadingReport}
+                  className="w-full py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-teal-400 hover:text-teal-300 text-xs font-semibold border border-slate-800 hover:border-teal-500/40 transition flex items-center justify-center gap-2"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  {loadingReport ? 'Loading Resume Optimization Report...' : 'View Full Activity & Resume Optimization Report'}
+                </button>
+              ) : (
+                <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-teal-400">Activity &amp; Resume Optimization Report</span>
+                    <button onClick={() => setReportData(null)} className="text-slate-500 hover:text-white text-xs">Hide</button>
+                  </div>
+                  <pre className="text-[11px] text-slate-300 font-mono whitespace-pre-wrap max-h-48 overflow-y-auto bg-slate-900/90 p-3 rounded-lg border border-slate-800/80">
+                    {reportData.report || JSON.stringify(reportData, null, 2)}
+                  </pre>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Actions */}
+            <div className="pt-2 flex items-center justify-end gap-3 border-t border-slate-800">
+              {(auditModal.externalApplicationUrl || auditModal.external_application_url) && (
+                <a
+                  href={auditModal.externalApplicationUrl || auditModal.external_application_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs inline-flex items-center gap-1.5 transition shadow-lg shadow-blue-500/20"
+                >
+                  <span>🏢 Open Company Portal</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              )}
+              {auditModal.job_url && (
+                <a
+                  href={auditModal.job_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-4 py-2 rounded-xl bg-teal-500 hover:bg-teal-400 text-slate-950 font-bold text-xs inline-flex items-center gap-1.5 transition shadow-lg shadow-teal-500/20"
+                >
+                  <span>Open Job on Platform</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              )}
+              <button
+                onClick={() => {
+                  setAuditModal(null);
+                  setReportData(null);
+                }}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Profile Modal */}
       {profileModal && (

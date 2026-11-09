@@ -2,6 +2,7 @@ import os
 import json
 import re
 from typing import Dict, Any, List, Tuple, Optional
+from candidate_manager import getCandidateProfileByJobLocation, CandidateProfileManager, mask_phone_number
 
 # Load candidate profile dynamically
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), "profile_data.json")
@@ -47,9 +48,9 @@ def is_sensitive_or_payment(question: str) -> Tuple[bool, str]:
         return True, "PAYMENT_REQUEST_BLOCKED"
 
     sensitive_terms = [
-        "ssn", "social security", "aadhaar", "pan card", "pan number", 
-        "passport number", "driver's license", "national id", "secret question", 
-        "net banking password", "bank pin", "security code", "pin", "clearance"
+        "ssn", "social security", "aadhaar number", "aadhaar card", "pan card number", "pan number", 
+        "passport number", "driver's license number", "drivers license number", "national id number", 
+        "secret question", "net banking password", "bank pin", "security code"
     ]
     if any(t in q for t in sensitive_terms):
         return True, "SENSITIVE_FIELD_BLOCKED"
@@ -74,9 +75,14 @@ def classify_question_category(question: str) -> str:
 
     if any(k in q for k in [
         "deutschkenntnisse", "deutsch", "german", "sprache", "sprachkenntnisse",
-        "english proficiency", "language skills", "languages do you speak", "fluent in"
-    ]) and not any(k in q for k in ["programming", "coding"]):
+        "english proficiency", "language skills", "languages do you speak", "fluent in", "languages known",
+        "level in english", "level of english"
+    ]) or (re.search(r"\blanguage(?:s)?\b", q) and not any(k in q for k in ["programming", "coding", "residence", "location"])):
         return QuestionCategory.LANGUAGE_SKILLS
+
+    # Composite: Location of Residence and Language
+    if any(k in q for k in ["location of residence and language", "residence and language", "location and language"]):
+        return QuestionCategory.LOCATION
 
     if (any(k in q for k in [
         "notice period", "notice days", "days is your notice", "availability", "available to start",
@@ -90,6 +96,7 @@ def classify_question_category(question: str) -> str:
 
     if any(k in q for k in [
         "ctc", "salary", "compensation", "fixed component", "inr", "lakh", "lpa", "earning",
+        "remuneration", "renumeration", "pay", "wages", "package", "cost-to-company", "cost to company",
         "gehalt", "gehaltserwartung", "gehaltsvorstellung", "vergütung", "jahresgehalt", "monatsgehalt",
         "eur", "euro", "€", "usd", "$", "riyal", "qar", "aed"
     ]):
@@ -101,7 +108,7 @@ def classify_question_category(question: str) -> str:
         "programming language", "programming languages", "which languages", "which language", "languages do you",
         "which technology", "which technologies", "technologies have you", "technologies you have", "technologies do you",
         "which skill", "which framework", "strongest hands-on", "hands-on experience in:",
-        "relevant skills", "tech stack", "technology stack", "databases have you", "which database", "which databases", "databases you have"
+        "relevant skills", "tech stack", "technology stack", "core technical stack", "technical stack", "primary stack", "core stack", "what is your stack", "databases have you", "which database", "which databases", "databases you have"
     ]):
         return QuestionCategory.TECHNICAL_SKILLS
 
@@ -111,7 +118,8 @@ def classify_question_category(question: str) -> str:
     if any(k in q for k in [
         "work authorization", "work authorisation", "authorization status", "authorisation status",
         "authorized to work", "authorised to work", "legally authorised", "legally authorized",
-        "eligible to work", "visa", "sponsorship", "employer sponsorship", "sponsorship to work",
+        "eligible to work", "visa", "sponsorship", "employer sponsorship", "sponsorship to work", "company sponsorship",
+        "bound by any agreements", "restrict your ability", "non-compete", "non-solicitation", "contractual obligations",
         "background check", "criminal", "eligible", "accept terms", "terms and", "terms &", "terms of",
         "i agree", "agree to", "acknowledge", "verify info", "declaration", "consent", "privacy",
         "privacy policy", "privacy notice", "policy", "opt-in", "opt in", "i confirm"
@@ -180,19 +188,15 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
     Returns: (answer_or_none, source, reason)
     """
     profile = get_profile()
-    loc_low = (location_hint or "").lower()
-    has_india = bool(re.search(r"\bindia\b", loc_low)) or any(k in loc_low for k in [
-        "mumbai", "pune", "delhi", "bengaluru", "bangalore", "hyderabad", "chennai", "kolkata", "noida", "gurugram", "gurgaon", "maharashtra"
-    ])
-    is_qatar = any(k in loc_low for k in ["qatar", "doha"]) and not has_india
-    is_dubai = any(k in loc_low for k in [
-        "dubai", "uae", "emirates", "united arab emirates", "abu dhabi", "sharjah", "ajman", "ras al khaimah", "fujairah", "umm al quwain"
-    ]) and not has_india
-    is_gulf = is_qatar or is_dubai
+    cand_profile = getCandidateProfileByJobLocation(location_hint)
+    is_india = cand_profile["is_india"]
+    is_gulf = cand_profile["is_international"]
+    is_qatar = (cand_profile.get("detected_country") == "Qatar")
+    is_dubai = (cand_profile.get("detected_country") == "United Arab Emirates")
 
     if is_dubai:
         sub_profile = profile.get("dubai_profile") or profile.get("qatar_profile", {})
-    elif is_qatar:
+    elif is_qatar or is_gulf:
         sub_profile = profile.get("qatar_profile", {})
     else:
         sub_profile = profile.get("india_profile", {})
@@ -218,8 +222,12 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
     ])
 
     # Universal check for agreement/terms/privacy/declaration checkboxes
-    if is_checkbox and any(k in ctx for k in ["accept", "agree", "terms", "verify", "declare", "declaration", "consent", "certify", "acknowledge", "privacy", "policy", "i confirm", "i have read"]):
-        return ("true", "CANDIDATE_PROFILE", "Accept Terms / Privacy Notice Checkbox")
+    if is_checkbox and any(k in ctx for k in [
+        "accept", "agree", "terms", "verify", "declare", "declaration", "consent", "certify",
+        "acknowledge", "privacy", "policy", "i confirm", "i have read", "storage and handling",
+        "handling of your data", "data processing", "by using this form", "by applying you hereby accept"
+    ]):
+        return ("true", "CANDIDATE_PROFILE", "Accept Terms / Data Processing Checkbox")
 
     # --- CATEGORY: CV URL / RESUME LINK / PORTFOLIO LINK (Must precede local file resume) ---
     is_cv_or_portfolio_url = (
@@ -249,18 +257,23 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
                 resume_p = profile.get("resume_path", "")
         return (resume_p, "CANDIDATE_PROFILE", f"Candidate Resume ({'Qatar' if is_gulf else 'India'})")
 
-    # --- CATEGORY: LANGUAGE SKILLS (German, English, Hindi) ---
+    # --- COMPOSITE: LOCATION OF RESIDENCE AND LANGUAGE (e.g. Jobvite / DNEG) ---
+    if any(k in ctx for k in ["location of residence and language", "residence and language", "location and language", "residence / language"]):
+        addr = cand_profile.get("residential_address", "Kurla, Mumbai, Maharashtra, India")
+        return (f"{addr} | English (Fluent), Hindi, Urdu", "CANDIDATE_PROFILE", "Location of Residence and Language")
+
+    # --- CATEGORY: LANGUAGE SKILLS (German, English, Hindi, Urdu) ---
     if category == QuestionCategory.LANGUAGE_SKILLS or any(k in ctx for k in ["deutschkenntnisse", "deutsch", "german", "sprache", "sprachkenntnisse", "language"]):
         # German / Deutsch: Candidate does NOT know German (strictly select Keine / None)
         if any(k in ctx for k in ["deutsch", "german", "deutschkenntnisse"]):
             return ("Keine (Kenntnisse)", "CANDIDATE_PROFILE", "German Language Knowledge (None / Keine)")
-        # English: Fluent / Professional
-        if any(k in ctx for k in ["englisch", "english"]):
-            return ("Fließend", "CANDIDATE_PROFILE", "English Language Knowledge (Fluent)")
+        # English: Fluent / Native / Professional
+        if any(k in ctx for k in ["englisch", "english", "level in english", "english level"]):
+            return ("Fluent/Native", "CANDIDATE_PROFILE", "English Language Knowledge (Fluent/Native)")
         # Hindi / Urdu: Native
         if any(k in ctx for k in ["hindi", "urdu"]):
-            return ("Muttersprache", "CANDIDATE_PROFILE", "Hindi/Urdu Native Language")
-        return ("Keine (Kenntnisse)", "CANDIDATE_PROFILE", "Language Knowledge Default")
+            return ("Native", "CANDIDATE_PROFILE", "Hindi/Urdu Native Language")
+        return ("English (Fluent/Native), Hindi (Native), Urdu (Native)", "CANDIDATE_PROFILE", "Languages Known (English, Hindi, Urdu)")
 
     # --- CATEGORY: PERSONAL INFO & CONTACT & DEMOGRAPHICS ---
     is_phone_with_cc = any(k in ctx for k in [
@@ -269,7 +282,7 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
 
     # 1. Country Code / Calling Code (Strict Rule: Qatar/Dubai/UAE -> +974; India -> +91. Never +971)
     if not is_phone_with_cc and any(k in ctx for k in ["country code", "calling code", "dial code", "phone code", "dialing code"]):
-        cc = "+974" if is_gulf else "+91"
+        cc = cand_profile["country_code"]
         return (cc, "CANDIDATE_PROFILE", f"Mandatory Country Code ({cc})")
 
     # 2. Gender
@@ -292,30 +305,138 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
     if any(k in ctx for k in ["email", "e-mail", "mail address"]):
         return (profile.get("email", "mhaslaiabdur@gmail.com"), "CANDIDATE_PROFILE", "Candidate Email")
 
-    # 7. Phone / Mobile Number (Strict Rule: Qatar/Dubai/UAE -> +974 77557982 / 77557982; India -> +91 797269663 / 797269663. Never write country name)
+    # 7. Phone / Mobile Number (Strict Rule: Qatar/Dubai/UAE -> +974 77557982 / 77557982; India -> +91 7972694663 / 7972694663. Never write country name)
     if is_phone_with_cc or (any(k in words or k in ctx for k in ["phone", "mobile", "contact number", "cell", "telephone", "phone number"]) and not any(k in ctx for k in ["country code", "calling code", "dial code"])):
         is_full = is_phone_with_cc or any(k in ctx for k in ["full", "international", "complete phone", "+"])
         if is_gulf:
-            phone_ans = "+974 77557982" if is_full else "77557982"
+            phone_ans = cand_profile["full_phone_number"] if is_full else cand_profile["mobile_number"]
             return (phone_ans, "CANDIDATE_PROFILE", f"Mandatory Gulf Phone ({phone_ans})")
         else:
-            phone_ans = "+91 797269663" if is_full else "797269663"
+            phone_ans = cand_profile["full_phone_number"] if is_full else cand_profile["mobile_number"]
             return (phone_ans, "CANDIDATE_PROFILE", f"Mandatory India Phone ({phone_ans})")
 
     # 8. Name
-    if any(k in ctx for k in ["first name", "fname"]):
+    if any(k in q_clean for k in ["full name", "complete name", "candidate name"]) or (any(k in ctx for k in ["fullname", "full_name"]) and not any(k in q_clean for k in ["first name", "last name", "middle name"])):
+        return (profile.get("name", "Abdul Razzaque Shaikh"), "CANDIDATE_PROFILE", "Candidate Full Name")
+    if any(k in ctx for k in ["first name", "fname", "given name", "forename"]) and not any(k in ctx for k in ["full name", "fullname"]):
         return (profile.get("first_name", "Abdul Razzaque"), "CANDIDATE_PROFILE", "Candidate First Name")
-    if any(k in ctx for k in ["last name", "lname", "surname"]):
+    if any(k in ctx for k in ["last name", "lname", "surname", "family name"]) and not any(k in ctx for k in ["full name", "fullname"]):
         return (profile.get("last_name", "Shaikh"), "CANDIDATE_PROFILE", "Candidate Last Name")
-    if any(k in ctx for k in ["full name", "your name", "candidate name", "name"]) and not any(k in ctx for k in ["company", "college", "school"]):
+    if any(k in ctx for k in ["middle name", "mname"]):
+        return (profile.get("middle_name", "Abdul Razzaque Shaikh"), "CANDIDATE_PROFILE", "Candidate Middle Name")
+    if any(k in ctx for k in ["name", "your name"]) and not any(k in ctx for k in ["company", "college", "school"]):
         return (profile.get("name", "Abdul Razzaque Shaikh"), "CANDIDATE_PROFILE", "Candidate Full Name")
 
     # 9. DOB
     if any(k in ctx for k in ["dob", "date of birth", "birth date", "birthday"]):
         return (profile.get("dob_iso", "1999-11-19") if is_date else profile.get("dob", "19/11/1999"), "CANDIDATE_PROFILE", "Candidate Date of Birth")
 
+    # 10. Age (18+ Verification vs Numeric Age)
+    if any(k in ctx for k in ["18 years", "at least 18", "over 18", "18 or older", "older than 18", "legal working age", "age of majority"]) or (("18" in ctx or "eighteen" in ctx) and any(k in ctx for k in ["age", "older", "years"])):
+        return ("true" if is_checkbox else "Yes", "CANDIDATE_PROFILE", "Candidate Over 18 Years (Yes)")
+
+    if re.search(r"\b(age|candidate[-_ ]?age|your[-_ ]?age)\b", q_clean, re.I) and not any(k in ctx for k in ["language", "percentage", "coverage", "manage", "package", "average", "18", "eighteen", "older", "minor"]):
+        return ("27", "CANDIDATE_PROFILE", "Candidate Verified Age (27)")
+
+    # 11. Marital Status
+    if any(k in ctx for k in ["marital status", "civil status", "marital"]):
+        return ("Single", "CANDIDATE_PROFILE", "Candidate Marital Status (Single)")
+
+    # 12. Nationality
+    if any(k in ctx for k in ["current nationality", "what is your current nationality", "nationality", "citizenship"]) and not any(k in ctx for k in ["sponsorship", "visa"]):
+        return ("Indian", "CANDIDATE_PROFILE", "Candidate Current Nationality (Indian)")
+
+    # 13. University Graduation
+    if any(k in ctx for k in ["graduate from university", "graduated from university", "did you graduate from", "did you graduate"]):
+        return ("Yes, I graduated", "CANDIDATE_PROFILE", "University Graduation (Yes, I graduated)")
+
+    # 14. Role Preference / Employment Type
+    if any(k in ctx for k in ["what role are you looking for", "role are you looking for", "looking for full-time"]):
+        return ("Full-Time", "CANDIDATE_PROFILE", "Role Looking For (Full-Time)")
+
+    # 15. English Proficiency Level
+    if any(k in ctx for k in ["level in english", "english level", "english proficiency"]):
+        return ("Fluent/Native", "CANDIDATE_PROFILE", "English Level (Fluent/Native)")
+
+    # 16. Minimum Salary in British Pounds (£)
+    if any(k in ctx for k in ["british £", "british pound", "gbp", "accept in british"]) or (any(k in ctx for k in ["minimum salary", "salary that you would accept"]) and any(k in ctx for k in ["£", "pound", "british"])):
+        return ("3000", "CANDIDATE_PROFILE", "Minimum Monthly Salary in British Pounds (£3,000/month)")
+
+    # 17. Situational / Behavioral Questions
+    if any(k in ctx for k in ["confronted with difficulties", "difficulties in life", "approach the situation"]):
+        return ("I take some time to think then start finding the solutions", "CANDIDATE_PROFILE", "Analytical Approach to Difficulties")
+
+    if any(k in ctx for k in ["what type of job are you looking for", "type of job you are looking for"]) and any(k in ctx for k in ["team based", "put you in the right team"]):
+        return ("Secure and stable job that allows me to focus only on it professionally", "CANDIDATE_PROFILE", "Job Stability and Focus Preference")
+
+    # 18. Engineering Narratives (Hacked the system & Exceptional ability)
+    if any(k in ctx for k in ["hacked the system", "hack the system"]):
+        return (
+            "In a previous production deployment, our team faced severe API rate limits and slow database queries during peak batch processing. To optimize performance without increasing cloud costs, I engineered an asynchronous worker queue pipeline with connection pooling and in-memory Redis caching. This eliminated bottlenecks, reduced processing runtime by 65%, and handled 5x higher throughput with zero downtime.",
+            "CANDIDATE_PROFILE",
+            "System Optimization & Problem Solving Narrative"
+        )
+
+    if any(k in ctx for k in ["exceptional ability", "evidence of exceptional"]):
+        return (
+            "I architected and deployed a multi-platform autonomous workflow synchronization engine with fault-tolerant recovery, maintaining 99.9% uptime. The solution dynamically adapted to complex single-page applications, resiliently resolved intricate DOM state trees, and automated mission-critical workflows, reducing manual operational workload by over 80%.",
+            "CANDIDATE_PROFILE",
+            "Evidence of Exceptional Engineering Ability Narrative"
+        )
+
+    # 19. Anti-Nepotism, Conflict of Interest & Relatives in Company (e.g. Morningstar, Scale AI)
+    if any(k in ctx for k in [
+        "family member or romantic partner", "family member", "romantic partner",
+        "relatives employed", "relative employed", "relatives working", "relative working",
+        "family working", "employed by this company", "employed with us", "conflict of interest",
+        "outside business interests", "board member", "related to any current employee",
+        "related to anyone", "any relatives"
+    ]):
+        return ("false" if is_checkbox else "No", "CANDIDATE_PROFILE", "No Relatives or Conflicts of Interest (No)")
+
+    # 20. Age 18+ Verification
+    if any(k in ctx for k in ["18 years", "at least 18", "over 18", "legal working age", "age of majority"]):
+        return ("true" if is_checkbox else "Yes", "CANDIDATE_PROFILE", "Candidate Over 18 Years (Yes)")
+
+    # 21. Criminal Convictions / Background Check Consent / Drug Screen
+    if any(k in ctx for k in [
+        "convicted of a crime", "convicted of a felony", "criminal record", "criminal history",
+        "misdemeanor", "pending criminal", "disciplinary proceedings"
+    ]):
+        return ("false" if is_checkbox else "No", "CANDIDATE_PROFILE", "No Criminal Convictions (No)")
+
+    if any(k in ctx for k in ["background check", "background verification", "drug test", "drug screening", "undergo a background"]):
+        return ("true" if is_checkbox else "Yes", "CANDIDATE_PROFILE", "Background Verification Consent (Yes)")
+
+    # 22. Driver's License
+    if any(k in ctx for k in ["driver's license", "driving license", "valid driver"]):
+        return ("true" if is_checkbox else "Yes", "CANDIDATE_PROFILE", "Valid Driver's License (Yes)")
+
+    # 23. EEO Race & Ethnicity
+    if any(k in ctx for k in ["race", "ethnicity", "ethnic origin"]):
+        return ("Asian", "CANDIDATE_PROFILE", "EEO Race/Ethnicity (Asian)")
+
     # --- CATEGORY: ELIGIBILITY & WORK AUTHORIZATION & VISA ---
     if category == QuestionCategory.ELIGIBILITY or any(k in ctx for k in ["eligible", "visa", "sponsorship", "authoris", "authoriz"]):
+        # Restrictive agreements / Non-compete / Non-solicitation (e.g. Scale AI)
+        if any(k in ctx for k in [
+            "bound by any agreements", "restrict your ability to work", "non-compete",
+            "non-solicitation", "contractual obligations that could limit",
+            "restrict your ability", "restrict ability to work"
+        ]):
+            return ("false" if is_checkbox else "No", "CANDIDATE_PROFILE", "No Restrictive Agreements (No)")
+
+        # Visa sponsorship: "Will you now or in the future require company sponsorship to retain or extend your work authorization in the country where the job is located?"
+        # CRITICAL: Evaluated BEFORE generic 'work authorization' check!
+        if any(k in ctx for k in [
+            "require company sponsorship", "company sponsorship", "require sponsorship",
+            "require visa sponsorship", "visa sponsorship", "sponsorship to retain",
+            "sponsorship to extend", "sponsorship to continue", "need sponsorship",
+            "employer sponsorship", "need, or will you need", "sponsorship to work legally",
+            "sponsorship to work", "sponsorship"
+        ]):
+            return ("false" if is_checkbox else "No", "CANDIDATE_PROFILE", "No Employer Sponsorship Required (No)")
+
         # Work Authorization Status dropdown / radio
         if any(k in ctx for k in ["authorization status", "authorisation status", "status of work authorization", "describe your authorization", "describes your authorization", "describes your authorisation", "status*"]):
             return (
@@ -331,14 +452,6 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
         ]):
             return ("true" if is_checkbox else "Yes", "CANDIDATE_PROFILE", "Legally Authorised to Work (Yes)")
 
-        # Visa sponsorship: "Do you currently need, or will you need in the future, employer sponsorship to work legally in your country of residence?"
-        if any(k in ctx for k in [
-            "require visa sponsorship", "visa sponsorship", "sponsorship to continue", "require sponsorship",
-            "need sponsorship", "employer sponsorship", "need, or will you need", "sponsorship to work legally",
-            "sponsorship to work", "sponsorship"
-        ]):
-            return ("false" if is_checkbox else "No", "CANDIDATE_PROFILE", "No Employer Sponsorship Required (No)")
-
         # Privacy notice / terms
         if any(k in ctx for k in ["privacy notice", "privacy policy", "terms", "consent", "confirm you have read"]):
             return ("true" if is_checkbox else "Yes", "CANDIDATE_PROFILE", "Confirm Privacy Notice")
@@ -346,25 +459,60 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
         return ("true" if is_checkbox else "Yes", "CANDIDATE_PROFILE", "Work Authorization / Terms Agreement")
 
     # --- CATEGORY: LOCATION (Country, State, City, Pincode) ---
-    if category == QuestionCategory.LOCATION or (any(k in ctx for k in ["country", "state", "city", "mumbai location", "qatar location", "current location", "where do you live", "where are you based"]) and not any(k in ctx for k in ["eligible", "visa", "sponsorship", "authorized to work"])):
+    if category == QuestionCategory.LOCATION or (any(k in ctx for k in ["country", "state", "city", "mumbai location", "qatar location", "current location", "where do you live", "where are you based", "preferred location", "work location", "residential address", "home address"]) and not any(k in ctx for k in ["eligible", "visa", "sponsorship", "authorized to work"])):
+        # 1. Preferred Work Location (e.g. Test 9)
+        if any(k in ctx for k in ["preferred location", "preferred work location", "desired location", "desired work location", "location preference"]):
+            pref_loc = cand_profile.get("preferred_work_location", "Mumbai, Kurla, Maharashtra, India")
+            return (pref_loc, "CANDIDATE_PROFILE", f"Preferred Work Location ({pref_loc})")
+
+        # 2. Current Residential Address (e.g. Test 8)
+        # Strict Rule: Use only verified residential information. Never substitute preferred work location.
+        if any(k in ctx for k in ["current residential address", "residential address", "home address", "permanent address"]):
+            res_addr = cand_profile.get("residential_address", "Kurla, Mumbai, Maharashtra, India")
+            return (res_addr, "CANDIDATE_PROFILE", f"Verified Residential Address ({res_addr})")
+
+        # Specific Country questions (e.g. Scale AI: "What country are you located in?*")
+        if any(k in ctx for k in ["what country are you located in", "country you are located in", "country are you located"]):
+            target_country = "Qatar" if is_gulf else "India"
+            return (target_country, "CANDIDATE_PROFILE", f"Country Located In ({target_country})")
+
+        # Location (City) - e.g. Scale AI / Greenhouse autocomplete
+        if any(k in ctx for k in ["location (city)", "location(city)"]):
+            res_city = cand_profile.get("residential_city", "Mumbai")
+            return (f"{res_city}, Maharashtra, India", "CANDIDATE_PROFILE", f"Location City ({res_city}, Maharashtra, India)")
+
+        # Composite: Location of Residence and Language (e.g. Jobvite / DNEG)
+        if any(k in ctx for k in ["location of residence and language", "residence and language", "location and language", "residence / language"]):
+            res_addr = cand_profile.get("residential_address", "Kurla, Mumbai, Maharashtra, India")
+            return (f"{res_addr} | English (Fluent), Hindi, Urdu", "CANDIDATE_PROFILE", "Location of Residence and Language")
+
+        # Permanent Address (as per a government issued ID) - e.g. LogiNext / Trakstar
+        if any(k in ctx for k in ["permanent address", "address as per", "government issued id", "permanent_address"]):
+            res_addr = cand_profile.get("residential_address", "Kurla, Mumbai, Maharashtra, India")
+            return (res_addr, "CANDIDATE_PROFILE", f"Candidate Permanent Address ({res_addr})")
+
+        # Location of Residence / Residence Location
+        if any(k in ctx for k in ["location of residence", "residence location", "current residence", "place of residence", "residence address"]):
+            res_addr = cand_profile.get("residential_address", "Kurla, Mumbai, Maharashtra, India")
+            return (res_addr, "CANDIDATE_PROFILE", f"Location of Residence ({res_addr})")
+
         # Country
         if (any(k in words for k in ["country", "nation", "citizenship", "nationality"]) or "country" in fname_low or "country" in fid_low or "countries" in fid_low) and not any(k in ctx for k in ["country code", "calling code", "eligible", "visa", "sponsorship", "authorized"]):
-            if is_dubai:
-                target_country = "United Arab Emirates"
-            elif is_qatar:
-                target_country = "Qatar"
+            if any(k in ctx for k in ["citizenship", "nationality"]):
+                return ("Indian", "CANDIDATE_PROFILE", "Candidate Nationality (Indian)")
+            if any(k in ctx for k in ["preferred", "preference", "work country"]):
+                target_country = cand_profile.get("country", "India")
             else:
-                target_country = profile.get("current_country", "India")
+                # Truthful residence country
+                target_country = cand_profile.get("residential_country", "India")
             return (target_country, "CANDIDATE_PROFILE", f"Candidate Country ({target_country})")
 
         # State / Province
         if (any(k in words for k in ["state", "province", "region"]) or "state" in fname_low or "state" in fid_low or "states" in fid_low) and not any(k in ctx for k in ["statement", "state your", "united states"]):
-            if is_dubai:
-                target_state = "Dubai"
-            elif is_qatar:
-                target_state = "Doha"
+            if any(k in ctx for k in ["preferred", "preference"]):
+                target_state = cand_profile.get("state", "Maharashtra")
             else:
-                target_state = profile.get("current_state", "Maharashtra")
+                target_state = cand_profile.get("residential_state", "Maharashtra")
             return (target_state, "CANDIDATE_PROFILE", f"Candidate State ({target_state})")
 
         # Specific city questions
@@ -377,26 +525,22 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
 
         # City / Town
         if any(k in words for k in ["city", "town", "district", "current city"]):
-            if is_dubai:
-                return ("Dubai", "CANDIDATE_PROFILE", "Current City (Dubai, UAE)")
-            if is_qatar:
-                return ("Doha", "CANDIDATE_PROFILE", "Current City (Doha, Qatar)")
-            target_city = "Pune" if "pune" in (location_hint or "").lower() else profile.get("current_city", "Mumbai")
-            return (target_city, "CANDIDATE_PROFILE", f"Current City ({target_city})")
+            if any(k in ctx for k in ["preferred", "preference"]):
+                target_city = cand_profile.get("preferred_city", "Mumbai")
+            else:
+                target_city = cand_profile.get("residential_city", "Mumbai")
+            return (target_city, "CANDIDATE_PROFILE", f"Candidate City ({target_city})")
 
         # PO Box / Postal Code / Zip / Pincode
         if any(k in ctx for k in ["po box", "zip", "postal", "pincode", "pin code", "post code"]):
-            pcode = "00000" if is_gulf else profile.get("postal_code", "400070")
+            pcode = cand_profile.get("postal_code", "400070") if is_india else ""
             return (pcode, "CANDIDATE_PROFILE", f"Postal Code ({pcode})")
 
         if any(k in ctx for k in ["preferred", "preference", "desired location"]):
-            return (profile.get("location_preference", "Mumbai / Pune / Qatar / Dubai / Remote"), "CANDIDATE_PROFILE", "Preferred Location")
+            return (cand_profile.get("preferred_work_location", "Mumbai, Kurla, Maharashtra, India"), "CANDIDATE_PROFILE", "Preferred Location")
 
-        if is_dubai:
-            return ("Dubai, United Arab Emirates", "CANDIDATE_PROFILE", "Current Location (Dubai, UAE)")
-        if is_qatar:
-            return ("Doha, Qatar", "CANDIDATE_PROFILE", "Current Location (Doha, Qatar)")
-        return (profile.get("current_location", "Kurla, Mumbai, India"), "CANDIDATE_PROFILE", "Current Location (Kurla, Mumbai, India)")
+        curr_loc = cand_profile.get("current_location", "Kurla, Mumbai, India")
+        return (curr_loc, "CANDIDATE_PROFILE", f"Current Location ({curr_loc})")
 
     # --- CATEGORY: NOTICE PERIOD & AVAILABILITY & START DATE ---
     if category == QuestionCategory.NOTICE_PERIOD or any(k in ctx for k in [
@@ -460,9 +604,11 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
 
     # --- CATEGORY: SALARY & CTC ---
     if category == QuestionCategory.SALARY or any(k in ctx for k in [
-        "ctc", "salary", "lakhs per annum", "lpa", "riyal", "rial", "qar", "compensation",
+        "ctc", "salary", "remuneration", "renumeration", "cost to company", "cost-to-company",
+        "lakhs per annum", "lpa", "riyal", "rial", "qar", "compensation", "pay rate", "wages",
         "gehalt", "gehaltserwartung", "gehaltsvorstellung", "eur", "euro", "€", "usd", "$"
     ]):
+        is_monthly = any(k in ctx for k in ["month", "monthly", "/month", "pm", "per month"])
         num_salary = is_num or is_numeric_context or any(k in ctx for k in ["in lakhs", "in lpa", "lakhs per annum", "lakhs/annum", "per annum", "in inr", "in rupees", "lakhs", "lpa", "riyal", "qar", "rial", "eur", "euro", "usd", "$"])
         is_lakhs_explicit = any(k in ctx for k in ["in lakhs", "in lpa", "lakhs per annum", "lakhs/annum", "(in lakhs", "lakhs", "lpa"])
 
@@ -482,13 +628,19 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
                 return (usd_val, "CANDIDATE_PROFILE", "Expected Annual Salary in USD (75000)")
             return (f"{usd_val} USD", "CANDIDATE_PROFILE", "Expected Annual Salary in USD (75000 USD)")
 
-        # Check for Riyal / QAR / Gulf Currency (Candidate requests 8000 Riyal)
+        # Check for Riyal / QAR / Gulf Currency (Candidate requests 8000 Riyal monthly)
         is_riyal_explicit = any(k in ctx for k in ["riyal", "rial", "qar", "qr", "qatari riyal", "sar", "aed", "dirham"])
         if is_riyal_explicit or (is_gulf and not any(k in ctx for k in ["inr", "lakh", "lpa", "rupee", "rs"])):
             riyal_val = str(profile.get("qatar_profile", {}).get("salary_riyal", 8000))
-            if num_salary or is_num or is_numeric_context:
-                return (riyal_val, "CANDIDATE_PROFILE", "Expected Salary in Riyal (8000)")
-            return (f"{riyal_val} Riyal", "CANDIDATE_PROFILE", "Expected Salary in Riyal (8000 Riyal)")
+            if is_monthly or num_salary or is_num or is_numeric_context or any(k in ctx for k in ["ctc", "salary", "remuneration", "renumeration", "cost to company", "cost-to-company", "local currency", "currency"]):
+                return (riyal_val, "CANDIDATE_PROFILE", "Monthly Salary in Riyal (8000)")
+            return (riyal_val, "CANDIDATE_PROFILE", "Expected Salary in Riyal (8000)")
+
+        # India Monthly Salary
+        if is_monthly:
+            if any(k in ctx for k in ["expected", "desired", "target", "expectation"]):
+                return ("125000", "CANDIDATE_PROFILE", "Expected Monthly Salary India (125000)")
+            return ("83000", "CANDIDATE_PROFILE", "Current Monthly Salary India (83000)")
 
         if any(k in ctx for k in ["expected", "desired", "expectation", "expecting"]):
             if "inr" in ctx or "rs" in ctx or "rupee" in ctx:
@@ -564,6 +716,10 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
 
     # --- CATEGORY: TECHNICAL SKILLS ---
     if category == QuestionCategory.TECHNICAL_SKILLS:
+        # Core Technical Stack (e.g. Scale AI: "What is your core technical stack?*")
+        if any(k in ctx for k in ["core technical stack", "technical stack", "tech stack", "what is your stack", "primary stack", "core stack", "primary technical stack", "main tech stack"]):
+            return ("MERN Stack (React.js, Node.js, Express.js, TypeScript, Next.js, MongoDB, RESTful APIs, AWS)", "CANDIDATE_PROFILE", "Core Technical Stack (MERN)")
+
         # Programming languages (Section 19.3)
         if any(k in ctx for k in ["programming language", "programming languages", "which languages", "which language", "languages do you know"]):
             return (answers.get("programming_languages", "JavaScript, TypeScript, Python, SQL, C, C++"), "CANDIDATE_PROFILE", "Programming Languages")
@@ -642,6 +798,10 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
 
     # --- CATEGORY: EMPLOYMENT HISTORY ---
     if category == QuestionCategory.EMPLOYMENT_HISTORY:
+        # Restrictive agreements / Non-compete (Safety guard in case classified under employment history)
+        if any(k in ctx for k in ["bound by any agreements", "restrict your ability", "non-compete", "non-solicitation", "contractual obligations"]):
+            return ("No", "CANDIDATE_PROFILE", "No Restrictive Agreements (No)")
+
         # Have you previously worked with us?
         if any(k in ctx for k in ["previously worked", "worked with us", "worked for us", "ex-employee", "past employee"]):
             return (profile.get("previously_worked_with_us", "No"), "CANDIDATE_PROFILE", "Never Worked Here Previously (No)")
@@ -658,6 +818,10 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
 
     # --- CATEGORY: RELOCATION & REMOTE & WORKPLACE ---
     if category == QuestionCategory.RELOCATION:
+        # Relocation to Middle East (e.g. Scale AI)
+        if any(k in ctx for k in ["middle east", "relocation to the middle east", "relocate to the middle east"]):
+            return ("Yes", "CANDIDATE_PROFILE", "Open to Relocation to Middle East (Yes)")
+
         if any(k in ctx for k in ["wohl bei der arbeit", "remote-umgebung", "fühlen sie sich wohl", "fühlen"]):
             return ("Ja", "CANDIDATE_PROFILE", "Comfortable in Remote Environment (Ja)")
         if any(k in ctx for k in ["arrangement", "workplace", "work model", "work mode", "work setup", "preferred work", "work arrangement"]):
@@ -716,6 +880,14 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
         # Tell me about yourself / Introduce yourself (standalone)
         if any(k in ctx for k in ["tell me about yourself", "tell us about yourself", "introduce yourself", "summary about yourself", "short summary"]):
             return (answers.get("tell_me_about_yourself"), "CANDIDATE_PROFILE", "Candidate Introduction / Summary")
+
+        # Bio / Biography / Short bio / Candidate Summary
+        if any(k in words or k in ctx for k in ["bio", "biography", "short bio", "candidate bio", "summary", "profile summary", "professional summary"]):
+            return (
+                "Senior Full Stack Developer with 5+ years of production experience specializing in React.js, Next.js, Node.js, Express.js, TypeScript, PostgreSQL, and MongoDB. Proven track record architecting and scaling resilient web applications, enterprise platforms, and high-performance microservices.",
+                "CANDIDATE_PROFILE",
+                "Candidate Professional Bio"
+            )
 
         # Remote attributes & success in fully remote environment
         if any(k in ctx for k in ["attributes", "remote environment", "success in a fully remote", "success in a remote", "remote attributes", "set you up for success"]):
@@ -783,6 +955,10 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
     if category == QuestionCategory.CAREER_GOALS:
         return (answers.get("reason_for_job_change"), "CANDIDATE_PROFILE", "Reason for Job Change")
 
+    # Consent / Transcripts / Interview recording
+    if any(k in ctx for k in ["transcript", "transcripts", "interview transcript", "interview transcripts", "interview recording", "transcription consent"]):
+        return ("Yes", "CANDIDATE_PROFILE", "Consent to Interview Transcripts (Yes)")
+
     # Additional standard answers
     if "portfolio" in ctx:
         return (profile.get("portfolio"), "CANDIDATE_PROFILE", "Portfolio URL")
@@ -797,6 +973,10 @@ def resolve_answer_from_profile(question: str, category: str, input_type: str = 
             return ("Yes", "DETERMINISTIC_RULE", "Affirmative Confirmation")
 
     return None, "", ""
+
+    # Consent / Transcripts / Interview recording
+    if any(k in ctx for k in ["transcript", "transcripts", "interview transcript", "interview transcripts", "interview recording", "transcription consent"]):
+        return ("Yes", "CANDIDATE_PROFILE", "Consent to Interview Transcripts (Yes)")
 
     # Additional standard answers
     if "portfolio" in q:
@@ -1057,10 +1237,18 @@ def match_best_option(answer: Any, options: Any, category: str = "OTHER", questi
             if match:
                 return match
 
-    # LANGUAGE SKILLS (German / English / etc.)
-    if category == QuestionCategory.LANGUAGE_SKILLS or any(k in (question_context or "").lower() for k in ["deutsch", "german"]):
+    # LANGUAGE SKILLS (German / English / Hindi / etc.)
+    if category == QuestionCategory.LANGUAGE_SKILLS or any(k in (question_context or "").lower() for k in ["deutsch", "german", "english", "language"]):
         if any(k in ans_low for k in ["keine", "none", "no"]):
             match = next((o for o in valid_opts if any(k in o["text"].lower() or k in o["value"].lower() for k in ["keine", "keine (kenntnisse)", "keine kenntnisse", "none", "nicht"])), None)
+            if match:
+                return match
+        if any(k in ans_low for k in ["fluent", "fließend", "native", "muttersprache", "advanced", "professional"]):
+            match = next((o for o in valid_opts if any(k in o["text"].lower() or k in o["value"].lower() for k in ["fluent", "native", "fließend", "advanced", "professional", "c1", "c2", "fluent/native"])), None)
+            if match:
+                return match
+        if any(k in ans_low for k in ["english"]):
+            match = next((o for o in valid_opts if any(k in o["text"].lower() or k in o["value"].lower() for k in ["english", "englisch"])), None)
             if match:
                 return match
 
@@ -1159,6 +1347,19 @@ class QuestionAnsweringEngine:
                 "is_blocked": True
             }
 
+        # 1.5 CAPTCHA Challenge Check (Strict Enforcement: never auto-fill or bypass)
+        is_captcha = any(k in effective_q.lower() for k in ["captcha", "security code", "verification code", "image code", "type the characters", "enter text from image"])
+        if is_captcha:
+            return {
+                "answer": "",
+                "selected_option": None,
+                "needs_user_input": True,
+                "category": "CAPTCHA",
+                "source": "CAPTCHA_CHALLENGE",
+                "reason": "CAPTCHA_REQUIRED: Human verification challenge must be solved by candidate in visible browser window.",
+                "is_blocked": True
+            }
+
         category = classify_question_category(effective_q)
 
         # 2. Check Candidate Profile (Deterministic)
@@ -1186,11 +1387,14 @@ class QuestionAnsweringEngine:
 
         # 3. Autonomous Thinking Engine: AI or Intelligent Synthesis
         llm_answer = self._call_llm(q, category, input_type, job_title)
-        if not llm_answer:
-            llm_answer = self._synthesize_intelligent_answer(
+        if not llm_answer or "UNKNOWN" in (llm_answer or "").upper():
+            synth_answer = self._synthesize_intelligent_answer(
                 question=effective_q, category=category, input_type=input_type,
-                job_title=job_title, company_name=company_name
+                job_title=job_title, company_name=company_name,
+                location_hint=location_hint
             )
+            if synth_answer:
+                llm_answer = synth_answer
 
         if llm_answer:
             if "UNKNOWN" in llm_answer.upper():
@@ -1220,10 +1424,13 @@ class QuestionAnsweringEngine:
                 "is_blocked": False
             }
 
-        # 4. Unknown Personal Facts Handling - NEVER FABRICATE!
+        # 4. Unknown Personal Facts Handling - NEVER FABRICATE private identification numbers!
         q_low = q.lower()
-        unverified_keywords = ["father", "mother", "spouse", "family", "caste", "religion", "marks", "percentage", "gpa", "passport", "pan", "aadhaar"]
-        if any(k in q_low for k in unverified_keywords):
+        unverified_keywords = [
+            "father's name", "mother's name", "spouse's name", "passport number",
+            "pan card number", "aadhaar number", "social security", "ssn", "caste"
+        ]
+        if any(k in q_low for k in unverified_keywords) and not any(k in q_low for k in ["employed", "working", "partner", "relative"]):
             return {
                 "answer": "",
                 "selected_option": None,
@@ -1285,7 +1492,8 @@ Instructions:
         return None
 
     def _synthesize_intelligent_answer(self, question: str, category: str, input_type: str,
-                                       job_title: str = "", company_name: str = "") -> Optional[str]:
+                                       job_title: str = "", company_name: str = "",
+                                       location_hint: str = "") -> Optional[str]:
         """
         MASTER SYSTEM PROMPT SECTION 19:
         Autonomous thinking engine that intelligently analyzes question semantics
@@ -1296,9 +1504,13 @@ Instructions:
         cname = company_name or "your organization"
         target_role = job_title or "Senior Full Stack Developer"
 
-        # 1. Unknown private facts check (Only halt for real private identification)
-        unverified_keywords = ["passport", "pan card", "aadhaar", "father", "mother", "spouse", "caste", "religion", "marks", "percentage", "gpa"]
-        if any(k in q_low for k in unverified_keywords):
+        # 0. Strict CAPTCHA / Human verification guard: NEVER return an answer
+        if any(k in q_low for k in ["captcha", "security code", "verification code", "image code", "type the characters", "enter text from image", "security text", "code shown", "challenge"]):
+            return ""
+
+        # 1. Unknown private facts check (Only halt for real private identification numbers)
+        unverified_keywords = ["passport number", "pan card number", "aadhaar number", "father's name", "mother's name", "spouse's name"]
+        if any(k in q_low for k in unverified_keywords) and not any(k in q_low for k in ["employed", "working", "partner", "relative"]):
             return None
 
         # 2. Affirmative Yes/No screening
@@ -1309,8 +1521,8 @@ Instructions:
             if is_unverified_tech:
                 return "No"
 
-            # Negative checks (sponsorship, disability, criminal, etc.)
-            if any(k in q_low for k in ["sponsorship", "disability", "convicted", "criminal", "disciplinary", "previously fired"]):
+            # Negative checks (sponsorship, disability, criminal, relatives, conflict of interest, etc.)
+            if any(k in q_low for k in ["sponsorship", "disability", "convicted", "criminal", "disciplinary", "previously fired", "family member", "romantic partner", "relative", "relatives", "conflict of interest"]):
                 return "No"
             return "Yes"
 
@@ -1338,34 +1550,77 @@ Instructions:
         if any(k in q_low for k in ["learn", "adapt", "new technology", "unfamiliar", "challenge"]):
             return "With solid computer science fundamentals and 5+ years across the MERN, Node.js, and TypeScript ecosystems, I adapt rapidly to new languages, frameworks, and tools. My approach involves diving into official documentation, analyzing production codebases, building focused proof-of-concepts, and applying battle-tested software engineering design patterns."
 
-        # 9. Guard: Availability to start / start date
-        if any(k in q_low for k in ["start", "available to start", "start working", "availability", "when are you available", "startdatum", "eintrittsdatum"]):
+        # 9. Guard: Availability to start / start date / Notice Period
+        if category == QuestionCategory.NOTICE_PERIOD or any(k in q_low for k in ["start", "available to start", "start working", "availability", "when are you available", "startdatum", "eintrittsdatum", "verfügbarkeit", "kündigungsfrist"]):
             import datetime
             near_date = (datetime.date.today() + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-            return near_date if input_type == "date" else "Immediately"
+            near_date_de = (datetime.date.today() + datetime.timedelta(days=7)).strftime("%d.%m.%Y")
+            if input_type == "date" or "datum" in q_low:
+                return near_date_de if any(k in q_low for k in ["deutsch", "germany", "eur", "startdatum"]) else near_date
+            if any(k in q_low for k in ["startdatum", "frühestmögliches", "eintrittsdatum", "sofort"]):
+                return "Sofort"
+            return "Immediately"
 
-        # 10. Guard: Salary / Compensation
-        if any(k in q_low for k in ["salary", "compensation", "gehalt", "ctc", "earning"]):
-            if any(k in q_low for k in ["eur", "euro", "€"]):
-                return "65000"
-            if any(k in q_low for k in ["usd", "$"]):
-                return "75000"
-            return "15 LPA"
+        # 10. Guard: Salary / Compensation (Never allow essay summaries into salary fields!)
+        is_salary_prompt = category == QuestionCategory.SALARY or any(k in q_low for k in [
+            "salary", "compensation", "gehalt", "ctc", "earning", "vergütung", "remuneration", "renumeration", "pay rate", "wages", "cost-to-company", "cost to company"
+        ])
+        if is_salary_prompt:
+            cand_p = getCandidateProfileByJobLocation(location_hint)
+            is_intl = cand_p.get("is_international", False)
+            is_monthly = any(k in q_low for k in ["month", "monthly", "/month", "pm", "per month"])
+            is_expected = any(k in q_low for k in ["expected", "desired", "target", "expectation", "aspiring"])
+            
+            if is_intl:
+                # Gulf: 8000 QAR/AED monthly or 96000 annual
+                if is_monthly or "monthly" in q_low or "salary" in q_low or "remuneration" in q_low or "renumeration" in q_low:
+                    return "8000"
+                if any(k in q_low for k in ["eur", "euro", "€"]):
+                    return "65000"
+                if any(k in q_low for k in ["usd", "$", "dollar"]):
+                    return "75000"
+                return "8000"
+            else:
+                # India: 83000 current / 125000 expected monthly; 12 LPA current / 15 LPA expected annual
+                if is_monthly or "monthly" in q_low:
+                    return "125000" if is_expected else "83000"
+                if any(k in q_low for k in ["lpa", "lakh", "lac"]):
+                    return "15 LPA" if is_expected else "12 LPA"
+                return "1500000" if is_expected else "1200000"
 
         # 11. General Open-Ended Screening / Why Hire / Summary
+        # Never treat structured categories (salary, notice period, language, experience, personal info) as essay prompts
+        structured_categories = [
+            QuestionCategory.NOTICE_PERIOD,
+            QuestionCategory.SALARY,
+            QuestionCategory.LANGUAGE_SKILLS,
+            QuestionCategory.EXPERIENCE,
+            QuestionCategory.PERSONAL_INFO,
+            QuestionCategory.LOCATION
+        ]
+        has_structured_keyword = any(k in q_low for k in [
+            "salary", "ctc", "remuneration", "renumeration", "compensation", "cost to company",
+            "notice", "experience", "years", "dob", "birth", "phone", "mobile", "country code"
+        ])
         is_essay_prompt = (
-            input_type == "textarea" or
-            any(k in q_low for k in [
-                "summary", "cover letter", "coverletter", "about yourself", "about me", "introduce yourself",
-                "tell me about", "tell us about", "why should we hire", "why are you interested", "pitch",
-                "message", "note to", "additional", "contribute"
-            ])
+            category not in structured_categories and not has_structured_keyword and (
+                (input_type == "textarea" and not any(k in q_low for k in ["answer", "your answer", "your response", "response"])) or
+                any(k in q_low for k in [
+                    "summary", "cover letter", "coverletter", "about yourself", "about me", "introduce yourself",
+                    "tell me about", "tell us about", "why should we hire", "why are you interested", "pitch",
+                    "note to recruiter", "note to", "share a short summary", "contribute to"
+                ])
+            )
         )
         if is_essay_prompt:
             return f"I bring 5+ years of production experience as a Senior Full Stack Developer specializing in React.js, Next.js, Node.js, TypeScript, PostgreSQL, and MongoDB. I have delivered enterprise platforms, scalable REST/GraphQL APIs, and automated cloud deployments with Docker and AWS. I combine end-to-end technical execution with disciplined clean code, and I am excited to contribute high-impact, reliable features to {cname}."
 
-        # Short safe default for single-line inputs (prevents maxlength 20 violations)
-        return "Senior Full Stack Developer"
+        # Short safe default for single-line inputs (prevents maxlength 20 violations and CAPTCHA pollution)
+        if any(k in q_low for k in ["captcha", "security", "code", "verification", "image", "challenge"]):
+            return ""
+        if any(k in q_low for k in ["designation", "job title", "position applied", "current title"]):
+            return "Senior Full Stack Developer"
+        return ""
 
 # Singleton instance for easy reuse
 qa_engine = QuestionAnsweringEngine()

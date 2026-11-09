@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import json
 import time
 import random
 import urllib.parse
@@ -15,7 +16,8 @@ from database import (
     record_application, 
     get_today_applied_count, 
     get_connection,
-    format_final_application_report
+    format_final_application_report,
+    check_already_applied_db
 )
 from ai_service import (
     evaluate_job_relevance, 
@@ -27,6 +29,7 @@ from form_engine import (
     validate_entire_form,
     detect_and_collect_form_questions
 )
+from candidate_manager import getCandidateProfileByJobLocation, mask_phone_number
 from question_answering import qa_engine
 
 GULF_CITIES = [
@@ -265,7 +268,53 @@ class NaukriGulfEngine:
         exp_text = job_info.get("experience", "5+ Years")
         job_url = job_info["url"]
 
+        if check_already_applied_db(title=title, company=company, job_url=job_url):
+            self.bot_state.add_log(f"Already applied or skipped {title} @ {company} in DB. Skipping.", "INFO")
+            return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "DUPLICATE_JOB"}
+
         self.bot_state.add_log(f"🌍 [NaukriGulf Application] Processing: {title} @ {company} ({loc_text})", "INFO")
+
+        # Step: Master Prompt Section 2 & 3: Deep JD Analysis & Resume Optimization
+        jd_text = ""
+        try:
+            jd_el = detail_tab.query_selector(".job-desc, .job-details, article, [class*='description'], .styles_JDC__dang-inner-html__73O4f")
+            if jd_el:
+                jd_text = jd_el.inner_text().strip()
+        except Exception:
+            pass
+        if not jd_text:
+            jd_text = f"{title} at {company} in {loc_text}. Experience: {exp_text}"
+
+        from resume_optimizer import analyze_job_description, resume_optimizer, generate_activity_report
+        jd_analysis = analyze_job_description(
+            job_title=title, company=company, job_desc=jd_text, location=loc_text, job_url=job_url, platform="NAUKRIGULF"
+        )
+
+        # SCENARIO C: Strict Disqualification Check
+        if not jd_analysis.should_apply:
+            self.bot_state.add_log(f"🛑 [Incompatible Role Disqualified] {title} @ {company}: {jd_analysis.disqualification_reason}", "WARNING")
+            skip_rep = generate_activity_report(
+                jd_analysis=jd_analysis,
+                optimization_res={"success": False, "customized_path": "", "original_path": ""},
+                application_status="Skipped (Incompatible Role)",
+                error_msg=jd_analysis.disqualification_reason
+            )
+            self.bot_state.add_log(f"📋 Application Report:\n{skip_rep}", "INFO")
+            record_application(
+                job_title=title, company_name=company, location=loc_text, job_url=job_url,
+                status=ApplicationStatus.APPLICATION_SKIPPED, apply_type='DIRECT_NAUKRIGULF',
+                match_score=jd_analysis.match_score,
+                notes=f"Skipped: {jd_analysis.disqualification_reason}",
+                failure_reason=jd_analysis.disqualification_reason,
+                experience_req=exp_text, platform="NAUKRIGULF",
+                jd_match_analysis_json=json.dumps(jd_analysis.to_dict())
+            )
+            return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": jd_analysis.disqualification_reason}
+
+        opt_res = resume_optimizer.optimize_resume(jd_analysis, is_india=False)
+        custom_pdf = opt_res.get("customized_path") if opt_res.get("success") else resume_optimizer.get_base_resume(is_india=False)
+        if opt_res.get("success"):
+            self.bot_state.add_log(f"📄 [Resume Optimized] Generated tailored Qatar CV: {os.path.basename(custom_pdf)} (Match: {jd_analysis.match_score}%)", "SUCCESS")
 
         action_type, action_btn = self.detect_job_action_button(detail_tab)
 
@@ -330,6 +379,15 @@ class NaukriGulfEngine:
         # Check if external page opened
         if new_tab_holder[0] and not new_tab_holder[0].is_closed():
             company_page = new_tab_holder[0]
+            ext_url = company_page.url or ""
+            if ext_url and ext_url != "about:blank":
+                if check_already_applied_db(title=title, company=company, job_url=job_url, external_url=ext_url):
+                    self.bot_state.add_log(f"🔁 [External Deduplication] Already applied or skipped in DB ({ext_url}) for {title} @ {company}. Closing tab and skipping.", "INFO")
+                    try:
+                        company_page.close()
+                    except Exception:
+                        pass
+                    return {"status": ApplicationStatus.APPLICATION_SKIPPED, "success": False, "failure_reason": "DUPLICATE_JOB"}
             self.bot_state.add_log(f"External tab detected after Easy Apply click. Navigated to: {company_page.url}", "INFO")
             return self.handle_external_company_portal(
                 context=context,
@@ -357,14 +415,38 @@ class NaukriGulfEngine:
         }""")
 
         if is_immediate_success:
+            activity_rep = generate_activity_report(
+                jd_analysis=jd_analysis,
+                optimization_res=opt_res,
+                application_status="Applied Successfully"
+            )
+            self.bot_state.add_log(f"📋 Application Activity Report:\n{activity_rep}", "SUCCESS")
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=job_url,
-                status=ApplicationStatus.APPLICATION_CONFIRMED, apply_type='DIRECT_NAUKRIGULF', match_score=score,
-                notes="Successfully applied via NaukriGulf Direct Easy Apply.", experience_req=exp_text,
-                platform="NAUKRIGULF"
+                status=ApplicationStatus.APPLICATION_CONFIRMED, apply_type='DIRECT_NAUKRIGULF', match_score=jd_analysis.match_score,
+                notes=f"Successfully applied via NaukriGulf Direct Easy Apply. Match: {jd_analysis.match_score}%.", experience_req=exp_text,
+                platform="NAUKRIGULF",
+                customized_resume_path=custom_pdf,
+                original_resume_path=opt_res.get("original_path", ""),
+                cv_changes_json=json.dumps(opt_res),
+                jd_match_analysis_json=json.dumps(jd_analysis.to_dict())
             )
             count = get_today_applied_count("NAUKRIGULF")
             self.bot_state.add_log(f"✅ [NaukriGulf SUCCESS] Application confirmed! [{count}/45] for {title} @ {company}", "SUCCESS")
+            gulf_rep = format_final_application_report(
+                company_name=company,
+                job_title=title,
+                job_location=loc_text,
+                platform="NaukriGulf",
+                application_type="Easy Apply",
+                jd_match=f"{jd_analysis.match_score}%",
+                resume_customized="Yes" if custom_pdf else "No",
+                resume_uploaded="Yes",
+                application_status="Yes",
+                submission_verified="Yes",
+                pending_action="None"
+            )
+            self.bot_state.add_log(f"📋 Application Report (Section 7):\n{gulf_rep}", "SUCCESS")
             self.cooldown_timer(min_sec=self.bot_state.config.cooldown_min_sec, max_sec=self.bot_state.config.cooldown_max_sec, stop_event=stop_event, reason=f"NaukriGulf confirmed for {company}")
             return {"status": ApplicationStatus.APPLICATION_CONFIRMED, "success": True}
 
@@ -417,14 +499,38 @@ class NaukriGulfEngine:
         }""")
 
         if is_confirmed:
+            activity_rep = generate_activity_report(
+                jd_analysis=jd_analysis,
+                optimization_res=opt_res,
+                application_status="Applied Successfully"
+            )
+            self.bot_state.add_log(f"📋 Application Activity Report:\n{activity_rep}", "SUCCESS")
             record_application(
                 job_title=title, company_name=company, location=loc_text, job_url=job_url,
-                status=ApplicationStatus.APPLICATION_CONFIRMED, apply_type='DIRECT_NAUKRIGULF', match_score=score,
-                notes="Successfully applied via NaukriGulf Direct Apply.", experience_req=exp_text,
-                platform="NAUKRIGULF"
+                status=ApplicationStatus.APPLICATION_CONFIRMED, apply_type='DIRECT_NAUKRIGULF', match_score=jd_analysis.match_score,
+                notes=f"Successfully applied via NaukriGulf Direct Apply. Match: {jd_analysis.match_score}%.", experience_req=exp_text,
+                platform="NAUKRIGULF",
+                customized_resume_path=custom_pdf,
+                original_resume_path=opt_res.get("original_path", ""),
+                cv_changes_json=json.dumps(opt_res),
+                jd_match_analysis_json=json.dumps(jd_analysis.to_dict())
             )
             count = get_today_applied_count("NAUKRIGULF")
             self.bot_state.add_log(f"✅ [NaukriGulf SUCCESS] Application confirmed! [{count}/45] for {title} @ {company}", "SUCCESS")
+            gulf_rep = format_final_application_report(
+                company_name=company,
+                job_title=title,
+                job_location=loc_text,
+                platform="NaukriGulf",
+                application_type="Easy Apply",
+                jd_match=f"{jd_analysis.match_score}%",
+                resume_customized="Yes" if custom_pdf else "No",
+                resume_uploaded="Yes",
+                application_status="Yes",
+                submission_verified="Yes",
+                pending_action="None"
+            )
+            self.bot_state.add_log(f"📋 Application Report (Section 7):\n{gulf_rep}", "SUCCESS")
             self.cooldown_timer(min_sec=self.bot_state.config.cooldown_min_sec, max_sec=self.bot_state.config.cooldown_max_sec, stop_event=stop_event, reason=f"NaukriGulf confirmed for {company}")
             return {"status": ApplicationStatus.APPLICATION_CONFIRMED, "success": True}
         else:
@@ -542,23 +648,10 @@ class NaukriGulfEngine:
 
                     self.bot_state.add_log(f"Inspecting [{job_idx+1}/{len(jobs_to_process)}] on NaukriGulf: {title} @ {company}", "INFO")
 
-                    # Check already applied in DB
-                    try:
-                        conn = get_connection()
-                        with conn.cursor() as cursor:
-                            cursor.execute("""
-                                SELECT id FROM job_applications 
-                                WHERE job_title = %s AND company_name = %s 
-                                  AND status IN ('APPLIED', 'APPLICATION_CONFIRMED', 'REDIRECT_REVIEW', 'APPLICATION_PENDING_CONFIRMATION')
-                                LIMIT 1
-                            """, (title, company))
-                            if cursor.fetchone():
-                                self.bot_state.add_log(f"Already applied to {title} @ {company} in DB. Skipping.", "INFO")
-                                conn.close()
-                                continue
-                            conn.close()
-                    except Exception:
-                        pass
+                    # Check already applied or skipped in DB
+                    if check_already_applied_db(title=title, company=company, job_url=job_url, job_id=job.get("id", "")):
+                        self.bot_state.add_log(f"Already applied or skipped {title} @ {company} in DB. Skipping.", "INFO")
+                        continue
 
                     # Step: AI Relevance Evaluation
                     profile = get_candidate_profile()

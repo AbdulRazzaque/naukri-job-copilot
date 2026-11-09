@@ -127,87 +127,24 @@ def evaluate_job_match(job_title: str, company: str, job_desc: str) -> Tuple[int
     Evaluates how well a job posting matches Abdul Razzaque Shaikh's profile:
     - 5+ years exp as Senior Full Stack Developer (MERN Stack)
     - Primary Stack: React.js, Next.js, Node.js, Express.js, TypeScript, JavaScript, MongoDB, PostgreSQL, MySQL
-    - Cloud/DevOps: Docker, Redis, Kafka, AWS, CI/CD, REST APIs, GraphQL
-    - STRICT EXCLUSION: Java / Java Full Stack / Spring Boot / .NET / C# roles are strictly rejected!
-    - Location: Mumbai / Pune / Remote (Based in Kurla, Mumbai)
-    - Returns: (score: 0-100, should_apply: bool, reason: str)
+    - Additional Tech: .NET / C# (6 months actual exp), Python (additional skill from CV)
+    - Zero Java experience (never invent).
+    - STRICT EXCLUSION: Dedicated Python / .NET / Java specialist roles skipped with PRIMARY_SPECIALIZATION_MISMATCH.
+    - APPLY for relevant mixed-technology roles (MERN + Python, MERN + .NET/C#, React + Node + Python).
     """
-    title_lower = (job_title or "").lower()
-    desc_lower = (job_desc or "").lower()
+    from technology_matcher import evaluate_technology_alignment
+    tech_eval = evaluate_technology_alignment(title=job_title, company=company, desc=job_desc)
 
-    # 1. STRICT DISQUALIFIER: Java / Java Full Stack / Spring Boot
-    # Note: Must use word boundary \bjava\b so 'javascript' is NEVER blocked!
-    is_java_title = bool(re.search(r"\bjava\b", title_lower)) and not bool(re.search(r"\bjavascript\b", title_lower))
-    has_java_phrases = bool(re.search(r"\b(spring boot|springboot|j2ee|hibernate|core java|java developer|java full stack|full stack java|java backend|java engineer|java software)\b", title_lower))
-    if is_java_title or has_java_phrases:
-        return 0, False, "Blocked: Java / Spring Boot role (Candidate specializes strictly in MERN / JavaScript Full Stack, not Java)."
+    # 1. Dedicated specialist in non-MERN tech (e.g. Dedicated Python, Dedicated .NET, Dedicated Java)
+    if not tech_eval["should_apply"]:
+        return tech_eval["match_score"], False, tech_eval["detailed_explanation"]
 
-    # 2. STRICT DISQUALIFIER: .NET / C# / PHP / Ruby
-    is_dotnet = any(k in title_lower for k in [".net", "dotnet", "c#", "asp.net"])
-    is_other_backend = bool(re.search(r"\b(php|laravel|wordpress|ruby|rails)\b", title_lower))
-    if is_dotnet or is_other_backend:
-        return 0, False, "Blocked: .NET / C# / PHP / Ruby role (Candidate is strictly MERN / JavaScript Full Stack)."
+    # 2. Recognized mixed-technology role (e.g. MERN + Python, MERN + .NET/C#)
+    if tech_eval.get("is_mixed_technology"):
+        return tech_eval["match_score"], True, tech_eval["detailed_explanation"]
 
-    target_terms = [
-        "full stack", "fullstack", "mern", "react", "react.js", "reactjs",
-        "node", "node.js", "nodejs", "next", "next.js", "nextjs",
-        "frontend", "front end", "backend", "back end", "web developer",
-        "software engineer", "software developer", "developer",
-        "javascript", "typescript", "express"
-    ]
-    
-    matches_title = any(term in title_lower for term in target_terms)
-    
-    if not matches_title:
-        return 40, False, "Job title does not match software/full-stack keywords"
-
-    # 3. Description-level check: Pure Java backend requirement with no MERN/Node
-    has_java_desc = bool(re.search(r"\b(core java|spring boot|j2ee|hibernate|java 8|java 11|java 17|java microservices)\b", desc_lower))
-    has_mern_desc = bool(re.search(r"\b(node|nodejs|node\.js|mern|react|reactjs|react\.js|javascript|typescript|next\.js|nextjs)\b", desc_lower))
-    if has_java_desc and not has_mern_desc:
-        return 20, False, "Blocked: Job description requires Java/Spring backend rather than MERN/JavaScript stack."
-
-    prompt = f"""
-Candidate: Abdul Razzaque Shaikh, Senior Full Stack Developer (5+ years exp).
-Current Company: Tharb (Working Remotely from Kurla, Mumbai).
-Current CTC: 12 LPA | Expected CTC: 15 LPA | Notice Period: Immediate Joiner (0 days notice, not serving notice).
-Preferred Location: Mumbai / Pune / Remote.
-Primary Tech Stack: React.js, Next.js, JavaScript, TypeScript, Node.js, Express.js, MongoDB, PostgreSQL, MySQL (MERN Stack).
-Advanced Skills: REST APIs, GraphQL, Docker, Redis, Kafka, AWS, CI/CD, database optimization, performance tuning.
-Domain Experience: Enterprise applications, multi-vendor e-commerce platforms, CRM and POS systems, HRMS platforms, and pharmacy management ERP solutions.
-Target Roles: Senior Full Stack Developer, MERN Stack Developer, Full Stack Developer, React.js Developer, Node.js Developer, Next.js Developer.
-
-CRITICAL DISQUALIFIER:
-- The candidate specializes in JavaScript, TypeScript, Node.js, React.js, Next.js, and MongoDB (MERN Stack).
-- The candidate does NOT know Java well and does NOT apply to Java Full Stack or Spring Boot positions.
-- If this position requires Java, Core Java, Spring Boot, J2EE, Hibernate, .NET, or C# as a primary backend technology, rate score below 40 and set should_apply to false.
-
-Job Title: {job_title}
-Company: {company}
-Snippet/Description: {job_desc[:1200]}
-
-Evaluate if this job is a good fit for Abdul across MERN, Node.js, React.js, Next.js, or Full Stack (JavaScript/TypeScript) positions. 
-Reply ONLY in valid JSON format with:
-{{"score": <integer 0-100>, "should_apply": <true/false>, "reason": "<1 short sentence>"}}
-"""
-    ai_resp = query_ai(prompt)
-    try:
-        cleaned = ai_resp.strip()
-        if "```json" in cleaned:
-            cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned:
-            cleaned = cleaned.split("```")[1].split("```")[0].strip()
-        
-        parsed = json.loads(cleaned)
-        score = int(parsed.get("score", 85))
-        should_apply = bool(parsed.get("should_apply", score >= 70))
-        reason = str(parsed.get("reason", "Strong alignment with React, Next.js, Node.js, TypeScript, and Full Stack stack."))
-        return score, should_apply, reason
-    except Exception:
-        # Final safety check before fallback: NEVER approve Java or .NET or non-MERN
-        if is_java_title or has_java_phrases or (has_java_desc and not has_mern_desc) or is_dotnet or is_other_backend:
-            return 0, False, "Blocked: Java / .NET / Non-MERN role (Candidate is strictly MERN / JavaScript Full Stack)."
-        return 88, True, "Matches Senior Full Stack / MERN / React / Node / Next.js developer profile."
+    # 3. Standard MERN / JavaScript Full Stack role
+    return tech_eval["match_score"], True, tech_eval["detailed_explanation"]
 
 def get_last_working_day(format_type: str = "text") -> str:
     """Calculates last working day exactly 30 days from today."""

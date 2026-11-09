@@ -339,7 +339,7 @@ class TestAgentAutomation(unittest.TestCase):
         # Now should be detected as already applied
         self.assertTrue(check_already_applied_db(unique_title, unique_company))
 
-        # Verify that SKIPPED or FAILED jobs do NOT block re-application
+        # Verify that SKIPPED jobs are ALSO blocked from re-application per user requirement
         skipped_company = f"SkippedTestCorp_{int(time.time()*1000)}"
         record_application(
             job_title=unique_title,
@@ -349,7 +349,7 @@ class TestAgentAutomation(unittest.TestCase):
             status=ApplicationStatus.APPLICATION_SKIPPED,
             notes="AI low match"
         )
-        self.assertFalse(check_already_applied_db(unique_title, skipped_company), "Skipped job should not be considered already applied")
+        self.assertTrue(check_already_applied_db(unique_title, skipped_company), "Skipped job must be considered already processed and blocked from re-application")
 
         # Clean up test rows
         try:
